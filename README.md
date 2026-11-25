@@ -4,8 +4,19 @@ Asistente de Dota 2 para mejorar jugando: te dice qué comprar, cómo counterear
 **teniendo en cuenta el parche actual**: lee las notas oficiales de Valve, detecta buffs y nerfs y los cruza con
 las winrates reales y su tendencia.
 
-> Proyecto hermano de [Dota Chat Translator](../dota-translator): reutiliza su integración GSI, la captura de la
-> barra superior y el enfoque multi-proveedor de IA.
+> Proyecto hermano de [Dota Chat Translator](https://github.com/Rucerdo/dota-translator): reutiliza su integración
+> GSI, la captura de la barra superior y el enfoque multi-proveedor de IA.
+
+## Descarga
+
+1. Descarga **`DotaCoach.exe`** de la [última versión](https://github.com/Rucerdo/dota-coach/releases/latest)
+   (un solo archivo, no hace falta instalar nada).
+2. Ábrelo: salen los ajustes. En "Dota 2" pulsa **Instalar GSI** y reinicia Dota una vez.
+3. Juega en **Ventana sin bordes** y pulsa **Iniciar coach**: el panel se abre en tu segunda pantalla si la tienes.
+4. Opcional: una clave de IA (Gemini tiene capa gratuita) y una de [STRATZ](https://stratz.com/api) (gratuita) para
+   estadísticas de tu rango.
+
+Se actualiza solo: al abrir comprueba si hay versión nueva en GitHub y la instala con un clic.
 
 ## Qué hace
 
@@ -29,7 +40,7 @@ las winrates reales y su tendencia.
 Sin IA funciona con reglas y estadísticas. Con IA (Claude, ChatGPT, Gemini, Groq, OpenRouter, DeepSeek o un modelo
 local) los consejos se adaptan al estado concreto de la partida.
 
-## Empezar
+## Desde el código
 
 ```powershell
 py -3 -m venv .venv
@@ -62,6 +73,13 @@ En los ajustes, "Abrir el coach automáticamente al lanzar Dota" añade `coach a
 usuario: espera a que se abra Dota, abre el coach y lo cierra (con el informe de la partida) al salir de Dota.
 
 Ejecutable: `build.bat` genera `dist\DotaCoach.exe` (PyInstaller, sin consola; sin argumentos abre los ajustes).
+
+### Publicar una versión
+
+1. Sube la versión en `coach/__init__.py` (`__version__ = "1.0.1"`) y haz commit.
+2. `git tag v1.0.1` y `git push origin v1.0.1`.
+3. GitHub Actions (`.github/workflows/release.yml`) pasa los tests, compila `DotaCoach.exe`, calcula su SHA-256 y
+   publica la release. Los `.exe` ya instalados la detectan y se actualizan.
 
 ## Panel de partida
 

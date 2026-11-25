@@ -6,6 +6,7 @@ y, en la selección de héroes, el draft. El panel pinta el resultado.
 """
 import json
 import logging
+import os
 import threading
 import time
 import tkinter as tk
@@ -387,6 +388,18 @@ def run_live(cfg: dict, gd: GameData, meta, manual_enemies: list[Hero] = (),
     gsi.start()
     if panel:
         panel.post("history", history(load_reports(30)))
+        if cfg.get("check_updates", True) and not os.environ.get("COACH_OFFLINE"):
+            def check_app_update():
+                from . import selfupdate
+                try:
+                    info = selfupdate.check_latest()
+                except Exception:
+                    return
+                if info:
+                    panel.post("toast", {"title": f"Dota Coach {info.version}",
+                                         "text": "Hay una versión nueva: actualiza desde los ajustes.",
+                                         "level": "info", "icon": "patch"})
+            threading.Thread(target=check_app_update, daemon=True).start()
         if update is not None:
             from .data.updater import heroes_without_traits
             update.missing_traits = heroes_without_traits(gd)

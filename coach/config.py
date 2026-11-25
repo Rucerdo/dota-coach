@@ -30,6 +30,7 @@ DEFAULTS = {
         "periodic_minutes": 8,
         "max_tips": 2,
     },
+    "check_updates": True,      # buscar versiones nuevas de la aplicación (GitHub Releases) al abrir
     "toasts": True,             # notificaciones flotantes (ganks, TPs, torres, rachas)
     "toasts_position": "game",  # game: encima de Dota, centradas bajo los retratos | panel: sobre el panel
     "timer_alerts": True,       # avisos de runas (recompensa, poder, sabiduría, loto) según tu rol

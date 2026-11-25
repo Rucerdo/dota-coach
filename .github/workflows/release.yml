@@ -1,0 +1,61 @@
+name: Build & Release
+
+# - Sube una etiqueta como v1.0.0 -> pasa los tests, compila DotaCoach.exe y publica una GitHub Release.
+# - A mano (pestaña Actions -> "Run workflow") -> compila y deja el .exe como artefacto, sin release.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements-dev.txt
+
+      - name: Check tag matches app version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}".TrimStart("v")
+          $ver = python -c "import coach; print(coach.__version__)"
+          if ($tag -ne $ver) { Write-Error "Tag v$tag does not match coach/__init__.py version $ver"; exit 1 }
+
+      - name: Tests
+        run: python -m pytest -q
+
+      - name: Build exe
+        run: python tools/build_exe.py
+
+      - name: SHA-256 checksum
+        shell: pwsh
+        run: |
+          Set-Location dist
+          "$((Get-FileHash DotaCoach.exe -Algorithm SHA256).Hash.ToLower())  DotaCoach.exe" | Out-File SHA256SUMS.txt -Encoding ascii
+          Get-Content SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DotaCoach
+          path: |
+            dist/DotaCoach.exe
+            dist/SHA256SUMS.txt
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/DotaCoach.exe
+            dist/SHA256SUMS.txt
+          generate_release_notes: true

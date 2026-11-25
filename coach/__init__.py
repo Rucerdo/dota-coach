@@ -1,2 +1,5 @@
 """Dota Coach: asistente de Dota 2 en tiempo real que tiene en cuenta el parche actual."""
-__version__ = "0.1.0"
+APP_NAME = "Dota Coach"
+__version__ = "1.0.0"
+GITHUB_REPO = "Rucerdo/dota-coach"   # releases con el .exe (lo usa el actualizador)
+EXE_NAME = "DotaCoach.exe"

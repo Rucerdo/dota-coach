@@ -84,9 +84,14 @@ class SettingsApp(ctk.CTk):
         self._build_stratz()
         self._build_game()
         self._build_dota()
+        self._build_updates()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.after(1000, self._poll_process)
         self._check_patch()
+        from .. import selfupdate
+        selfupdate.cleanup_old()  # restos de una actualización anterior
+        if self.cfg.get("check_updates", True) and not os.environ.get("COACH_OFFLINE"):
+            self.after(1500, lambda: self._check_updates(manual=False))
 
     def _check_patch(self):
         """Al abrir: ¿hay parche nuevo? (si lo hay, se renuevan los datos guardados). En segundo plano."""
@@ -570,6 +575,101 @@ class SettingsApp(ctk.CTk):
         self._refresh_dota()
         if not install:
             self.dota_status.configure(text="Integración quitada.", text_color=MUTED)
+
+    # ================= actualizaciones de la aplicación =================
+    def _build_updates(self):
+        from .. import __version__
+        c = self._section("Actualizaciones", "Las versiones nuevas se publican en GitHub. El .exe se actualiza solo: "
+                          "descarga la nueva, comprueba que no está dañada (SHA-256) y se reinicia.")
+        self._label(c, 2, f"Versión instalada: {__version__}")
+        self._switch(c, 3, "Buscar actualizaciones al abrir", "check_updates", self.cfg.get("check_updates", True))
+        row = ctk.CTkFrame(c, fg_color="transparent")
+        row.grid(row=4, column=0, columnspan=2, padx=16, pady=(6, 4), sticky="w")
+        self._button(row, "Buscar ahora", lambda: self._check_updates(manual=True)).pack(side="left", padx=(0, 8))
+        self.btn_update = self._button(row, "Actualizar", self._do_update, primary=True, width=200)
+        self.update_bar = ctk.CTkProgressBar(row, width=200, height=10, progress_color=ACCENT)
+        self.update_status = ctk.CTkLabel(c, text="", font=font(12), text_color=MUTED, wraplength=640,
+                                          justify="left")
+        self.update_status.grid(row=5, column=0, columnspan=2, padx=16, pady=(4, 16), sticky="w")
+        self.update_info = None
+
+    def _check_updates(self, manual: bool):
+        from .. import selfupdate
+        if manual:
+            self.update_status.configure(text="Buscando…", text_color=MUTED)
+        q: queue.Queue = queue.Queue()
+
+        def run():
+            try:
+                q.put((selfupdate.check_latest(), None))
+            except Exception as ex:
+                q.put((None, ex))
+        threading.Thread(target=run, daemon=True).start()
+
+        def poll():
+            try:
+                info, err = q.get_nowait()
+            except queue.Empty:
+                self.after(300, poll)
+                return
+            if err is not None:
+                if manual:
+                    self.update_status.configure(text=f"No se pudo comprobar: {err}", text_color=YELLOW)
+                return
+            if info is None:
+                if manual:
+                    self.update_status.configure(text="Tienes la última versión.", text_color=GREEN)
+                return
+            self.update_info = info
+            notes = (info.notes.splitlines() or [""])[0][:160]
+            self.update_status.configure(text=f"Hay una versión nueva: {info.version}. {notes}", text_color=GREEN)
+            self.btn_update.configure(text=f"Actualizar a la {info.version}")
+            self.btn_update.pack(side="left", padx=(0, 8))
+        self.after(300, poll)
+
+    def _do_update(self):
+        from .. import selfupdate
+        info = self.update_info
+        if info is None:
+            return
+        if not selfupdate.can_self_update(info):
+            webbrowser.open(info.page_url)  # desde Python (o carpeta sin permisos): se descarga a mano
+            self.update_status.configure(text="Abierta la página de la versión nueva para descargarla.",
+                                         text_color=MUTED)
+            return
+        self.btn_update.configure(state="disabled", text="Descargando…")
+        self.update_bar.set(0)
+        self.update_bar.pack(side="left")
+        q: queue.Queue = queue.Queue()
+
+        def run():
+            try:
+                path = selfupdate.download(info, progress=lambda f: q.put(("progress", f)))
+                q.put(("done", path))
+            except Exception as ex:
+                q.put(("error", ex))
+        threading.Thread(target=run, daemon=True).start()
+
+        def poll():
+            try:
+                while True:
+                    kind, value = q.get_nowait()
+                    if kind == "progress":
+                        self.update_bar.set(value)
+                    elif kind == "error":
+                        self.btn_update.configure(state="normal", text=f"Actualizar a la {info.version}")
+                        self.update_status.configure(text=f"No se pudo actualizar: {value}", text_color=RED)
+                        return
+                    else:
+                        if self.proc and self.proc.poll() is None:
+                            self.proc.terminate()  # el coach en marcha usa el .exe viejo
+                        selfupdate.install_and_restart(value)
+                        self.destroy()
+                        return
+            except queue.Empty:
+                pass
+            self.after(150, poll)
+        self.after(150, poll)
 
     # ================= cierre =================
     def on_close(self):
