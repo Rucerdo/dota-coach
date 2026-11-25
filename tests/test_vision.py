@@ -52,3 +52,20 @@ def test_unknown_tiles_saved_and_labeled(gd, matcher):
     assert saved
     dest = topbar.label_tile(saved[0], gd.hero("Lion"))
     assert dest.exists() and not saved[0].exists()
+
+
+def test_diagnose_saved_screenshot(gd, matcher):
+    """Una captura completa guardada: recorta los 10 huecos y compara con lo esperado."""
+    shot = Image.new("RGB", (1920, 1080), "black")
+    client = (0, 0, 1920, 1080)
+    lineup = [gd.hero(n) for n in ("am", "cm", "Juggernaut", "Lion", "Riki")] + [None] * 4 + [gd.hero("pa")]
+    for pid, h in enumerate(lineup):
+        if h:
+            box = topbar.tile_box(pid, client, topbar.DEFAULT_TOPBAR)
+            shot.paste(_img(h.id, (box[2] - box[0], box[3] - box[1])), box[:2])
+    expect = list(lineup)
+    expect[1] = gd.hero("Naga Siren")  # error a propósito
+    rows = topbar.diagnose(matcher, shot, None, expect)
+    assert [r["ok"] for r in rows] == [True, False, True, True, True, None, None, None, None, True]
+    assert not rows[6]["valid"]
+    assert rows[1]["hero"].loc == "Crystal Maiden"

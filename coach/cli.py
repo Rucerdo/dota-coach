@@ -183,6 +183,8 @@ def cmd_vision(args, cfg, gd):
         for f in files:
             print(f"  {f.name}")
         print('Etiquétalos con: coach vision label <archivo> "<héroe>"')
+    elif args.action == "test":
+        _vision_test(args, cfg, gd, topbar)
     elif args.action == "label":
         h = gd.hero(args.hero or "")
         path = Path(args.file)
@@ -191,6 +193,53 @@ def cmd_vision(args, cfg, gd):
         if not h or not path.exists():
             sys.exit("Uso: coach vision label <archivo> \"<héroe>\"")
         print(f"Plantilla de {h.loc}: {topbar.label_tile(path, h)}")
+
+
+def _vision_test(args, cfg, gd, topbar):
+    """Analiza capturas guardadas (una o una carpeta) sin necesidad de tener Dota abierto."""
+    from PIL import Image
+    src = Path(args.file or "")
+    if src.is_dir():
+        files = sorted(f for f in src.iterdir()
+                       if f.suffix.lower() in (".png", ".jpg", ".jpeg") and not f.stem.endswith("_topbar"))
+    else:
+        files = [src] if src.is_file() else []
+    if not files:
+        sys.exit("Uso: coach vision test <captura.png | carpeta> [--expect \"h1,h2,...,h10\"]")
+    expect = None
+    if args.expect:
+        names = [x.strip() for x in args.expect.split(",")]
+        expect = [gd.hero(n) if n else None for n in names]
+        bad = [n for n, h in zip(names, expect) if n and not h]
+        if bad:
+            sys.exit(f"No reconozco: {', '.join(bad)}")
+    matcher = topbar.HeroMatcher(gd)
+    print(f"{matcher.load()} plantillas · umbral {topbar.MIN_SCORE} · margen {topbar.MIN_MARGIN}")
+    hits = total = 0
+    for f in files:
+        img = Image.open(f)
+        print(f"\n{f.name} ({img.width}x{img.height})")
+        for r in topbar.diagnose(matcher, img, cfg.get("topbar"), expect):
+            if not r["valid"]:
+                print(f"  {r['slot']}: (vacío u oscuro)")
+                continue
+            top = ", ".join(f"{h.loc if h else '?'} {sc:.2f}" for h, sc in r["top"])
+            got = r["hero"].loc if r["hero"] else "—"
+            mark = "" if r["ok"] is None else (" ✓" if r["ok"] else " ✗")
+            line = f"  {r['slot']}: {got:<20} margen {r['margin']:.2f} · {top}{mark}"
+            if r["ok"] is False:
+                rank = r["expected_rank"]
+                pos = "fuera del top" if rank is None else f"puesto {rank + 1}, {r['expected_score']:.2f}"
+                line += f" (esperado {r['expected'].loc}: {pos})"
+            print(line)
+            if r["ok"] is not None:
+                total += 1
+                hits += bool(r["ok"])
+        strip = f.with_name(f.stem + "_topbar.png")
+        topbar.strip_image(topbar.tiles_from_image(img, cfg.get("topbar"))).save(strip)
+        print(f"  recortes: {strip}")
+    if total:
+        print(f"\nAciertos: {hits}/{total}")
 
 
 def cmd_run(args, cfg, gd):
@@ -252,10 +301,11 @@ def main(argv=None):
     p.add_argument("--base-url")
 
     p = sub.add_parser("vision", help="reconocimiento de la barra superior")
-    p.add_argument("action", choices=["strip", "unknown", "label"])
+    p.add_argument("action", choices=["strip", "test", "unknown", "label"])
     p.add_argument("file", nargs="?")
     p.add_argument("hero", nargs="?")
     p.add_argument("--out", default="topbar.png")
+    p.add_argument("--expect", help="test: los 10 héroes en orden (Radiant 1-5, Dire 1-5); vacío si no se sabe")
 
     args = ap.parse_args(argv)
     _setup_logging(args.verbose)

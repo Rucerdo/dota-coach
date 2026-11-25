@@ -79,6 +79,13 @@ def looks_valid(img: Image.Image) -> bool:
     return stat.mean[0] > 18 and stat.stddev[0] > 14
 
 
+def tiles_from_image(img: Image.Image, cfg: dict | None = None) -> dict[int, Image.Image]:
+    """Los 10 recortes de una captura completa de la ventana de Dota (p. ej. una captura F12 de Steam)."""
+    cfg = {**DEFAULT_TOPBAR, **(cfg or {})}
+    client = (0, 0, img.width, img.height)
+    return {pid: img.crop(tile_box(pid, client, cfg)) for pid in range(10)}
+
+
 def capture_tiles(cfg: dict | None = None) -> dict[int, Image.Image]:
     client = dota_client_rect()
     if not client:
@@ -175,18 +182,24 @@ class HeroMatcher:
         log.info("plantilla aprendida para %s: %s", hero.loc, path.name)
         return path
 
-    def match(self, tile: Image.Image) -> tuple[Hero | None, float, float]:
-        """(héroe, puntuación, margen sobre el mejor OTRO héroe)."""
+    def ranked(self, tile: Image.Image) -> list[tuple[int, float]]:
+        """[(hero_id, mejor puntuación de sus plantillas)] de mayor a menor; vacío si el recorte no vale."""
         with self._lock:
             matrix, ids = self.matrix, list(self.ids)
         if matrix is None or not looks_valid(tile):
-            return None, 0.0, 0.0
+            return []
         scores = matrix @ _vector(tile, self.aspect)
         best_per_hero: dict[int, float] = {}
         for hid, s in zip(ids, scores):
             if s > best_per_hero.get(hid, -2.0):
                 best_per_hero[hid] = float(s)
-        ranked = sorted(best_per_hero.items(), key=lambda kv: kv[1], reverse=True)
+        return sorted(best_per_hero.items(), key=lambda kv: kv[1], reverse=True)
+
+    def match(self, tile: Image.Image) -> tuple[Hero | None, float, float]:
+        """(héroe, puntuación, margen sobre el mejor OTRO héroe)."""
+        ranked = self.ranked(tile)
+        if not ranked:
+            return None, 0.0, 0.0
         best_id, best = ranked[0]
         second = ranked[1][1] if len(ranked) > 1 else 0.0
         if best < MIN_SCORE or best - second < MIN_MARGIN:
@@ -300,17 +313,41 @@ def label_tile(path: Path, hero: Hero) -> Path:
     return dest
 
 
-def save_debug_strip(path: Path, cfg: dict | None = None) -> Path | None:
-    """Guarda los 10 recortes uno al lado del otro (para comprobar la calibración)."""
-    tiles = capture_tiles(cfg)
-    if not tiles:
-        return None
+def diagnose(matcher: "HeroMatcher", img: Image.Image, cfg: dict | None = None,
+             expect: list[Hero | None] | None = None) -> list[dict]:
+    """Analiza una captura guardada: por cada hueco, los 3 mejores candidatos, si se aceptaría y si acierta."""
+    rows = []
+    for pid, tile in tiles_from_image(img, cfg).items():
+        ranked = matcher.ranked(tile)
+        hero, score, margin = matcher.match(tile)
+        want = expect[pid] if expect and pid < len(expect) else None
+        want_rank = next((i for i, (hid, _) in enumerate(ranked) if want and hid == want.id), None)
+        rows.append({
+            "slot": pid, "valid": looks_valid(tile), "hero": hero, "score": score, "margin": margin,
+            "top": [(matcher.gd.heroes.get(hid), sc) for hid, sc in ranked[:3]],
+            "expected": want, "expected_rank": want_rank,
+            "expected_score": ranked[want_rank][1] if want_rank is not None else None,
+            "ok": None if want is None else (hero is not None and hero.id == want.id),
+        })
+    return rows
+
+
+def strip_image(tiles: dict[int, Image.Image]) -> Image.Image:
+    """Los 10 recortes uno al lado del otro, con un hueco entre bandos."""
     w, h = tiles[0].size
     out = Image.new("RGB", (w * 10 + 45, h), "black")
     for pid, t in tiles.items():
         out.paste(t.resize((w, h)), (pid * w + (45 if pid >= 5 else 0), 0))
-    out.save(path)
+    return out
+
+
+def save_debug_strip(path: Path, cfg: dict | None = None) -> Path | None:
+    """Guarda los 10 recortes de la pantalla actual (para comprobar la calibración)."""
+    tiles = capture_tiles(cfg)
+    if not tiles:
+        return None
+    strip_image(tiles).save(path)
     return path
 
 
-__all__ = ["HeroMatcher", "TopbarScanner", "capture_tiles", "save_debug_strip"]
+__all__ = ["HeroMatcher", "TopbarScanner", "capture_tiles", "diagnose", "save_debug_strip", "tiles_from_image"]
