@@ -90,12 +90,13 @@ def cmd_draft(args, cfg, gd):
     from .engine.draft import suggest_picks
     enemies = _heroes(gd, args.enemies, "enemigos")
     allies = _heroes(gd, args.allies, "aliados")
-    if not enemies:
-        sys.exit("Indica al menos un enemigo: --enemies \"pa, lion\"")
+    if not enemies and not allies:
+        sys.exit("Indica enemigos y/o aliados: --enemies \"pa, lion\" --allies \"cm\" (turbo: solo --allies)")
     meta = Meta.build(gd, cfg.get("rank_bracket", 0))
     role = args.role or cfg.get("role", "auto")
-    picks = suggest_picks(gd, enemies, allies, role, meta, opendota.matchups, limit=args.top)
-    print(f"Contra {', '.join(h.loc for h in enemies)} · rol {role} · parche {meta.patch}")
+    picks = suggest_picks(gd, enemies, allies, role, meta, opendota.matchups, limit=args.top, synergy=opendota.synergy)
+    who = (f"Contra {', '.join(h.loc for h in enemies)}" if enemies else "Pick a ciegas") +         (f" · con {', '.join(h.loc for h in allies)}" if allies else "")
+    print(f"{who} · rol {role} · parche {meta.patch}")
     for i, s in enumerate(picks, 1):
         print(f"{i:2}. {s.line()}")
     if args.ai:
@@ -322,7 +323,7 @@ def main(argv=None):
     g.add_argument("--general", action="store_true")
 
     p = sub.add_parser("draft", help="qué héroe elegir")
-    p.add_argument("--enemies", required=True)
+    p.add_argument("--enemies")
     p.add_argument("--allies")
     p.add_argument("--role", choices=["auto", "carry", "core", "support"])
     p.add_argument("--top", type=int, default=8)
