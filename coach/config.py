@@ -17,7 +17,7 @@ DEFAULTS = {
     "gsi_port": 53124,          # el traductor usa 53123: pueden convivir
     "dota_dir": "",
     "lang": "es",
-    "role": "auto",             # auto | core | support
+    "role": "auto",             # auto | carry | core | support
     "rank_bracket": 0,          # 0 = todos; 1 Herald, 2 Guardian, ... 8 Immortal (para el meta de OpenDota)
     "ai": {
         "provider": "none",     # none | claude | openai | gemini | groq | openrouter | deepseek | custom

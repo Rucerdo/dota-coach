@@ -34,6 +34,7 @@ def gd() -> GameData:
         Item(254, "item_glimmer_cape", "Glimmer Cape", 2150),
         Item(37, "item_ghost", "Ghost Scepter", 1500),
         Item(102, "item_force_staff", "Force Staff", 2200),
+        Item(127, "item_pipe", "Pipe of Insight", 3725),
     ]
     abilities = {5004: "Mana Break", 5191: "Blur", 5192: "Immaterial"}
     return GameData(heroes, items, abilities)

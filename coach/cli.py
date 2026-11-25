@@ -223,7 +223,7 @@ def main(argv=None):
     p = sub.add_parser("draft", help="qué héroe elegir")
     p.add_argument("--enemies", required=True)
     p.add_argument("--allies")
-    p.add_argument("--role", choices=["auto", "core", "support"])
+    p.add_argument("--role", choices=["auto", "carry", "core", "support"])
     p.add_argument("--top", type=int, default=8)
     p.add_argument("--ai", action="store_true")
 
@@ -231,7 +231,7 @@ def main(argv=None):
     p.add_argument("--hero")
     p.add_argument("--enemies")
     p.add_argument("--owned", help="objetos que ya tienes, separados por comas")
-    p.add_argument("--role", choices=["auto", "core", "support"])
+    p.add_argument("--role", choices=["auto", "carry", "core", "support"])
     p.add_argument("--gold", type=int, default=0)
     p.add_argument("--minute", type=int, default=10)
     p.add_argument("--top", type=int, default=6)

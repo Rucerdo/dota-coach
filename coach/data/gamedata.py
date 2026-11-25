@@ -59,6 +59,14 @@ HERO_ALIASES = {
     "mk": "monkey_king", "dw": "dark_willow", "pl": "phantom_lancer", "tb": "terrorblade", "ck": "chaos_knight",
     "bb": "bristleback", "ench": "enchantress", "doom": "doom_bringer", "zeus": "zuus", "necro": "necrolyte",
     "wd": "witch_doctor", "sd": "shadow_demon", "sk": "sand_king", "es": "earthshaker", "ogre": "ogre_magi",
+    "tide": "tidehunter", "nyx": "nyx_assassin", "spec": "spectre", "apparition": "ancient_apparition",
+    "bounty": "bounty_hunter", "brood": "broodmother", "cent": "centaur", "clock": "rattletrap",
+    "gyro": "gyrocopter", "invo": "invoker", "lesh": "leshrac", "mag": "magnataur", "morph": "morphling",
+    "nature": "furion", "prophet": "furion", "shaker": "earthshaker", "sky": "skywrath_mage",
+    "skywrath": "skywrath_mage", "bara": "spirit_breaker", "wraith": "skeleton_king", "dusa": "medusa",
+    "gondar": "bounty_hunter", "grim": "grimstroke", "primal": "primal_beast", "alch": "alchemist",
+    "arc": "arc_warden", "bat": "batrider", "beast": "beastmaster", "drow": "drow_ranger", "dawn": "dawnbreaker",
+    "elder": "elder_titan", "omni": "omniknight", "terror": "terrorblade", "dazz": "dazzle", "veng": "vengefulspirit",
 }
 
 # Abreviaturas de la comunidad → nombre interno del objeto

@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from ..data.gamedata import GameData, Hero
-from .counters import player_role
+from .counters import HARD_CARRIES, player_role
 
 PRIOR_GAMES = 50          # suavizado: la muestra es de partidas pro (pequeña); con pocas, la ventaja tiende a 0
 META_WEIGHT = 0.6         # 1 punto de meta_score (≈1 pt de winrate) vale 0.6 pts de ventaja de matchup
@@ -53,6 +53,8 @@ def suggest_picks(gd: GameData, enemies: list[Hero], allies: list[Hero] = (), ro
     out = []
     for h in gd.heroes.values():
         if h.id in taken:
+            continue
+        if role == "carry" and h.loc not in HARD_CARRIES:
             continue
         if role in ("core", "support") and player_role(h) != role:
             continue

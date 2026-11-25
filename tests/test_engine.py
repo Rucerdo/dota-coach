@@ -3,7 +3,7 @@ import json
 from coach.ai.base import LLMError, Provider
 from coach.config import DEFAULTS
 from coach.engine.advisor import Advisor
-from coach.engine.counters import player_role, suggest_items
+from coach.engine.counters import item_role, player_role, suggest_items
 from coach.engine.draft import advantage, suggest_picks
 from coach.gsi import GameState
 
@@ -26,6 +26,28 @@ def test_counters_core(gd):
     names = [s.item for s in sugg]
     assert "item_monkey_king_bar" in names and "item_mjollnir" in names and "item_dust" in names
     assert "item_glimmer_cape" not in names  # objeto de support
+
+
+def test_item_role(gd):
+    assert item_role(gd.hero("Juggernaut")) == "carry"
+    assert item_role(gd.hero("cm")) == "support"
+    assert item_role(gd.hero("Juggernaut"), "core") == "core"
+    assert player_role(gd.hero("Juggernaut"), "carry") == "core"
+
+
+def test_carry_skips_team_items(gd):
+    enemies = [gd.hero("Lion"), gd.hero("cm"), gd.hero("pa")]
+    carry = [s.item for s in suggest_items(gd, gd.hero("Juggernaut"), enemies)]
+    assert "item_pipe" not in carry and "item_monkey_king_bar" in carry
+    offlane = [s.item for s in suggest_items(gd, gd.hero("Juggernaut"), enemies, role="core")]
+    assert "item_pipe" in offlane
+
+
+def test_must_have_counter_beats_common_trait(gd):
+    # Dust contra un solo invisible va por delante de un counter genérico contra varios
+    sugg = suggest_items(gd, gd.hero("Juggernaut"), [gd.hero("Riki"), gd.hero("Lion"), gd.hero("cm")])
+    names = [s.item for s in sugg]
+    assert names.index("item_dust") < names.index("item_black_king_bar")
 
 
 def test_counters_skip_owned_and_support(gd):

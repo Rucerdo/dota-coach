@@ -21,7 +21,7 @@ from ..ai.base import LLMError, Provider
 from ..ai.prompts import TIPS_SCHEMA, tips_prompt
 from ..data.gamedata import GameData, Hero
 from ..gsi import GameState
-from .counters import TRAIT_LABELS, ItemSuggestion, enemy_traits, player_role, suggest_items
+from .counters import TRAIT_LABELS, ItemSuggestion, enemy_traits, item_role, suggest_items
 
 log = logging.getLogger(__name__)
 
@@ -175,7 +175,7 @@ class Advisor:
     # ---------- IA ----------
     def context(self, st: GameState, triggers: list[str], sugg: list[ItemSuggestion]) -> str:
         hero = self.my_hero(st)
-        role = player_role(hero, self.cfg.get("role", "auto"))
+        role = item_role(hero, self.cfg.get("role", "auto"))
         enemies = list(self.enemies.values())
         lines = [
             f"Trigger: {', '.join(triggers)}",
