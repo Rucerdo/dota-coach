@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# Local debug files
+topbar.png
+gsi_*.json
+gsi_*.jsonl
+*.log
+
+# Claude Code (notas y ajustes locales)
+CLAUDE.md
+.claude/
+
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
