@@ -2,6 +2,7 @@
 más lo que realmente se compra con tu héroe (OpenDota), anotado con los cambios del parche actual."""
 import json
 import logging
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -83,6 +84,66 @@ POPULARITY_WEIGHT = 12
 # Objetos que resuelven lo mismo: de cada grupo solo se sugiere el de más prioridad
 ALTERNATIVES = [{"item_dust", "item_gem"}, {"item_orchid", "item_bloodthorn"}]
 
+# Fases de la partida: cada una pesa lo que se compra en ese momento (OpenDota) y castiga lo que no cabe en su
+# presupuesto (al empezar no tiene sentido sugerir una BKB).
+PHASES = ["start", "early", "mid", "late"]
+PHASE_LABELS = {"start": "Inicio", "early": "Early (0-12)", "mid": "Mid (12-28)", "late": "Late (28+)"}
+PHASE_BUDGET = {"start": 600, "early": 2500, "mid": 5500, "late": None}
+PHASE_MAX_COST = {"start": 1000}  # tope estricto solo al salir: en early los counters grandes son el objetivo
+PHASE_POPULARITY = {
+    "start": {"start_game_items": 1.0},
+    "early": {"early_game_items": 1.0, "mid_game_items": 0.25},
+    "mid": {"mid_game_items": 1.0, "early_game_items": 0.2, "late_game_items": 0.4},
+    "late": {"late_game_items": 1.0, "mid_game_items": 0.5},
+    None: {"early_game_items": 0.4, "mid_game_items": 0.6, "late_game_items": 0.4},  # sin fase: toda la partida
+}
+
+
+# Objetos básicos que también se compran sueltos a mitad de partida (no son "solo un componente")
+STANDALONE = {"item_blink", "item_gem", "item_aghanims_shard", "item_smoke_of_deceit", "item_dust",
+              "item_ward_observer", "item_ward_sentry", "item_tpscroll"}
+
+
+# Botas: solo se llevan unas. Con unas ya mejoradas, solo tienen sentido sus mejoras (Arcane → Greaves...).
+BOOTS = {"item_boots", "item_phase_boots", "item_power_treads", "item_tranquil_boots", "item_arcane_boots",
+         "item_guardian_greaves", "item_travel_boots", "item_travel_boots_2", "item_boots_of_bearing"}
+UPGRADE_WEIGHT = 2.0       # completar algo con lo que ya llevas
+UPGRADE_MIN_COST = 1200    # objetos de este precio o más marcan una "ruta" (Maelstrom → Mjollnir)
+
+
+def components_of(gd: GameData, name: str, _seen: set | None = None) -> set[str]:
+    """Todos los componentes de un objeto, a cualquier profundidad (Mjollnir → Maelstrom → Mithril Hammer...)."""
+    seen = set() if _seen is None else _seen
+    item = gd.item(name)
+    for c in (item.components if item else []):
+        if c not in seen:
+            seen.add(c)
+            components_of(gd, c, seen)
+    return seen
+
+
+def owned_closure(gd: GameData, owned) -> set[str]:
+    """Lo que llevas más todo aquello con lo que ya está fabricado (Tranquil Boots ⇒ Boots of Speed)."""
+    out = set(owned)
+    for name in owned:
+        out |= components_of(gd, name)
+    return out
+
+
+def excluded_by_inventory(gd: GameData, name: str, owned, closure: set[str]) -> bool:
+    if name in closure:
+        return True  # ya lo llevas, o ya está dentro de algo que llevas
+    owned_boots = BOOTS.intersection(owned) - {"item_boots"}
+    if name in BOOTS and owned_boots:
+        return not (owned_boots & components_of(gd, name))  # otras botas: no; sus mejoras: sí
+    return False
+
+
+def phase_for(clock_seconds: int) -> str:
+    minute = clock_seconds / 60
+    return "start" if minute < 0 else "early" if minute < 12 else "mid" if minute < 28 else "late"
+
+
 # Lo básico de cualquier partida, con prioridad baja
 UTILITY = [("item_magic_wand", "any", "barato y salva vidas contra hechizos"), ("item_ward_observer", "support", "visión")]
 
@@ -95,6 +156,11 @@ class ItemSuggestion:
     priority: float
     reasons: list[str] = field(default_factory=list)
     patch_note: str = ""
+    remaining: int | None = None    # lo que falta pagar descontando componentes que ya llevas
+
+    @property
+    def to_pay(self) -> int:
+        return self.cost if self.remaining is None else self.remaining
 
     def line(self) -> str:
         why = "; ".join(dict.fromkeys(self.reasons))
@@ -131,17 +197,19 @@ def enemy_traits(enemies: list[Hero]) -> dict[str, list[str]]:
 
 
 def suggest_items(gd: GameData, my_hero: Hero | None, enemies: list[Hero], owned: list[str] = (),
-                  role: str = "auto", meta=None, popularity: dict | None = None, limit: int = 6
-                  ) -> list[ItemSuggestion]:
+                  role: str = "auto", meta=None, popularity: dict | None = None, limit: int = 6,
+                  phase: str | None = None) -> list[ItemSuggestion]:
+    """phase: start | early | mid | late (o None para toda la partida)."""
     role = item_role(my_hero, role)
     allowed = ROLE_ITEMS[role]
-    owned_set = set(owned)
+    owned = [o for o in owned if o]
+    closure = owned_closure(gd, owned)
     sugg: dict[str, ItemSuggestion] = {}
 
     def add(name: str, weight: float, reason: str):
         item = gd.item(name)
-        if not item or name in owned_set:
-            return  # objeto retirado del juego o ya comprado
+        if not item or excluded_by_inventory(gd, name, owned, closure):
+            return  # objeto retirado del juego, ya comprado o sin sentido con lo que llevas
         s = sugg.setdefault(name, ItemSuggestion(name, item.loc, item.cost, 0.0))
         s.priority += weight
         s.reasons.append(reason)
@@ -153,14 +221,34 @@ def suggest_items(gd: GameData, my_hero: Hero | None, enemies: list[Hero], owned
             weight = TRAIT_WEIGHT.get(trait, 1.0) * (1 + EXTRA_HERO_FACTOR * (len(heroes) - 1))
             add(name, weight, f"{why} ({', '.join(heroes)})")
 
-    if popularity:  # lo que más se compra con tu héroe a mitad/final de partida
-        for phase, weight in (("early_game_items", 0.4), ("mid_game_items", 0.6), ("late_game_items", 0.4)):
-            counts = popularity.get(phase) or {}
+    if popularity:  # lo que más se compra con tu héroe en esta fase de la partida
+        min_cost = 1 if phase == "start" else 500  # al salir sí cuentan tangos, ramas...
+        for key, weight in PHASE_POPULARITY[phase].items():
+            counts = popularity.get(key) or {}
             total = sum(counts.values()) or 1
-            for item_id, n in sorted(counts.items(), key=lambda kv: kv[1], reverse=True)[:4]:
+            for item_id, n in sorted(counts.items(), key=lambda kv: kv[1], reverse=True)[:5]:
                 it = gd.items.get(int(item_id))
-                if it and it.cost >= 500:
+                bare_component = (it is not None and not it.components and it.name not in STANDALONE
+                                  and it.name in getattr(gd, "component_names", ()))
+                if phase in ("mid", "late") and bare_component:
+                    continue  # p. ej. Broadsword: a estas alturas se compra para fabricar otra cosa
+                if it and it.cost >= min_cost:
                     add(it.name, weight * POPULARITY_WEIGHT * n / total, f"popular en {my_hero.loc if my_hero else 'tu héroe'}")
+
+    # Seguir la ruta del jugador: lo que se fabrica con un objeto importante que ya lleva (aunque no esté en
+    # ninguna lista) y, en todo lo sugerido, descontar del precio lo que ya tiene hecho.
+    routes = [o for o in owned if (gd.item(o) and gd.item(o).cost >= UPGRADE_MIN_COST)]
+    if routes:
+        for item in list(gd.items.values()):
+            used = [o for o in routes if o in item.components]
+            if used and item.cost > 0:
+                add(item.name, UPGRADE_WEIGHT * 0.6, f"se completa con tu {gd.item(used[0]).loc}")
+    for s in sugg.values():
+        inside = components_of(gd, s.item) & set(owned)
+        if inside:
+            done = sum(gd.item(c).cost for c in inside if gd.item(c))
+            s.remaining = max(0, s.cost - done)
+            s.priority += UPGRADE_WEIGHT * min(1.0, done / s.cost if s.cost else 0)
 
     for name, kind, why in UTILITY:
         if kind in allowed:
@@ -175,6 +263,15 @@ def suggest_items(gd: GameData, my_hero: Hero | None, enemies: list[Hero], owned
                 review = meta.item_reviews.get(s.loc.lower()) if hasattr(meta, "item_reviews") else None
                 s.patch_note = (review or {}).get("summary") or "; ".join(c.text for c in changes[:2])
 
+    cap = PHASE_MAX_COST.get(phase)
+    if cap:
+        sugg = {k: s for k, s in sugg.items() if s.to_pay <= cap}
+    budget = PHASE_BUDGET.get(phase)
+    if budget:
+        for s in sugg.values():
+            if s.cost > budget:
+                s.priority *= (budget / s.cost) ** 2
+
     out, used_groups = [], set()
     for s in sorted(sugg.values(), key=lambda s: s.priority, reverse=True):
         group = next((i for i, g in enumerate(ALTERNATIVES) if s.item in g), None)
@@ -184,3 +281,81 @@ def suggest_items(gd: GameData, my_hero: Hero | None, enemies: list[Hero], owned
             used_groups.add(group)
         out.append(s)
     return out[:limit]
+
+
+def counters_for(gd: GameData, enemy: Hero, my_hero: Hero | None = None, role: str = "auto",
+                 owned: list[str] = (), limit: int = 3) -> list[tuple[str, str]]:
+    """Los objetos que mejor counterean a UN enemigo para tu rol: [(item_*, motivo)], los ya comprados fuera."""
+    allowed = ROLE_ITEMS[item_role(my_hero, role)]
+    owned = [o for o in owned if o]
+    closure = owned_closure(gd, owned)
+    best: dict[str, tuple[float, str]] = {}
+    for trait in TRAITS.get(enemy.loc, []):
+        for name, kind, why in COUNTER_ITEMS.get(trait, []):
+            if kind not in allowed or not gd.item(name) or excluded_by_inventory(gd, name, owned, closure):
+                continue
+            weight = TRAIT_WEIGHT.get(trait, 1.0)
+            if weight > best.get(name, (0.0, ""))[0]:
+                best[name] = (weight, why)
+    ranked = sorted(best.items(), key=lambda kv: kv[1][0], reverse=True)
+    out, used_groups = [], set()
+    for name, (_, why) in ranked:
+        group = next((i for i, g in enumerate(ALTERNATIVES) if name in g), None)
+        if group is not None and group in used_groups:
+            continue
+        if group is not None:
+            used_groups.add(group)
+        out.append((name, why))
+    return out[:limit]
+
+
+@dataclass
+class PlanStep:
+    name: str            # item_* o "recipe"
+    loc: str
+    cost: int
+    owned: bool = False
+    to_pay: int = 0      # lo que falta de este paso (un componente a medias ya tiene parte pagada)
+
+    @property
+    def short(self) -> str:
+        return self.name.removeprefix("item_")
+
+
+def build_plan(gd: GameData, item_name: str, owned: list[str]) -> list[PlanStep]:
+    """Cómo fabricar un objeto con lo que llevas: primero lo que ya tienes (✓), luego lo que falta de más barato a
+    más caro (antes empiezas a notar las estadísticas) y la receta al final. Vacío si no tiene componentes."""
+    item = gd.item(item_name)
+    if not item or not item.components:
+        return []
+    inv = Counter(o for o in owned if o)
+    have, missing = [], []
+    for c in item.components:
+        comp = gd.item(c)
+        if not comp:
+            continue
+        if inv[c] > 0:
+            inv[c] -= 1
+            have.append(PlanStep(c, comp.loc, comp.cost, owned=True))
+            continue
+        paid = 0
+        for sub in comp.components:  # componente a medias (p. ej. Perseverance con un Ring of Health)
+            if inv[sub] > 0 and gd.item(sub):
+                inv[sub] -= 1
+                paid += gd.item(sub).cost
+        missing.append(PlanStep(c, comp.loc, comp.cost, to_pay=max(0, comp.cost - paid)))
+    recipe = item.cost - sum(gd.item(c).cost for c in item.components if gd.item(c))
+    steps = have + sorted(missing, key=lambda s: s.to_pay)
+    if recipe > 0:
+        steps.append(PlanStep("recipe", "Receta", recipe, to_pay=recipe))
+    return steps
+
+
+def next_purchase(plan: list[PlanStep], gold: int) -> PlanStep | None:
+    """El primer paso pendiente del plan que ya puedes pagar. La receta, solo cuando ya tienes todo lo demás
+    (comprarla antes no da nada)."""
+    pending = [s for s in plan if not s.owned]
+    parts = [s for s in pending if s.name != "recipe"]
+    if not parts:
+        return next((s for s in pending if s.to_pay <= gold), None)
+    return next((s for s in parts if s.to_pay <= gold), None)

@@ -84,3 +84,23 @@ def test_gray_template_only_for_gray(gd, matcher):
     matcher.learn(gd.hero("Lion"), dead)
     assert matcher.match(dead)[0].loc == "Lion"
     assert matcher.match(_img(777, (66, 35)))[0] is None
+
+
+def test_minimap_box_scales_and_moves():
+    from coach.vision.minimap import minimap_box
+    assert minimap_box((0, 0, 1920, 1080)) == (10, 844, 238, 1072)
+    l, t, r, b = minimap_box((0, 0, 2560, 1440))
+    assert (r - l, b - t) == (304, 304) and b == 1440 - round(8 * 1440 / 1080)
+    l, _, r, _ = minimap_box((0, 0, 1920, 1080), {"right_side": True})
+    assert r == 1910 and r - l == 228
+
+
+def test_scanner_draft_mode_switches_layout_and_forgets(gd, matcher):
+    scanner = TopbarScanner(matcher, lambda c: None)
+    scanner.confirmed[0] = gd.hero("pa")
+    assert scanner.layout() is None
+    scanner.set_mode("draft")
+    assert scanner.layout()["pitch"] == topbar.DRAFT_TOPBAR["pitch"] and not scanner.confirmed
+    scanner.confirmed[0] = gd.hero("pa")
+    scanner.set_mode("draft")                       # mismo modo: no se olvida
+    assert scanner.confirmed

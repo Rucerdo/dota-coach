@@ -53,7 +53,8 @@ def cfg_path(dota_dir: Path) -> Path:
 
 
 def cfg_content(port: int) -> str:
-    # 'minimap' es opcional: si Dota lo envía, se ven los héroes enemigos visibles en el minimapa
+    # 'minimap' trae las posiciones de los héroes (los enemigos solo si se ven). 'draft', 'neutralitems',
+    # 'couriers' y 'roshan' se piden para estudiar qué llega a un jugador (algunas son solo de espectador).
     return f'''"Dota Coach"
 {{
     "uri"        "http://127.0.0.1:{port}/"
@@ -72,6 +73,10 @@ def cfg_content(port: int) -> str:
         "events"     "1"
         "buildings"  "1"
         "minimap"    "1"
+        "draft"      "1"
+        "neutralitems" "1"
+        "couriers"   "1"
+        "roshan"     "1"
     }}
 }}
 '''

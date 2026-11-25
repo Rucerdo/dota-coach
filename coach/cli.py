@@ -15,7 +15,7 @@ import sys
 from pathlib import Path
 
 from . import config, dota
-from .ai import PROVIDER_IDS, LLMError, encrypt_key, make_provider
+from .ai import PROVIDER_IDS, LLMError, make_provider, set_ai
 from .data import opendota
 from .data.gamedata import GameData
 from .data.meta import Meta
@@ -111,7 +111,7 @@ def cmd_draft(args, cfg, gd):
 
 
 def cmd_items(args, cfg, gd):
-    from .engine.counters import enemy_traits, suggest_items, TRAIT_LABELS
+    from .engine.counters import PHASE_LABELS, TRAIT_LABELS, enemy_traits, phase_for, suggest_items
     hero = gd.hero(args.hero) if args.hero else None
     if args.hero and not hero:
         sys.exit(f"No reconozco el héroe '{args.hero}'")
@@ -119,7 +119,9 @@ def cmd_items(args, cfg, gd):
     owned = [it.name for it in (gd.item(x.strip()) for x in (args.owned or "").split(",")) if it]
     meta = Meta.build(gd, cfg.get("rank_bracket", 0))
     pop = opendota.item_popularity(hero.id) if hero else None
-    sugg = suggest_items(gd, hero, enemies, owned, args.role or cfg.get("role", "auto"), meta, pop, limit=args.top)
+    sugg = suggest_items(gd, hero, enemies, owned, args.role or cfg.get("role", "auto"), meta, pop, limit=args.top,
+                         phase=phase_for(args.minute * 60))
+    print(f"Fase: {PHASE_LABELS[phase_for(args.minute * 60)]} (minuto {args.minute})")
     traits = enemy_traits(enemies)
     if traits:
         print("Rasgos enemigos: " + "; ".join(f"{TRAIT_LABELS.get(t, t)}: {', '.join(h)}" for t, h in traits.items()))
@@ -150,14 +152,7 @@ def cmd_install(args, cfg, gd=None):
 
 def cmd_ai(args, cfg, gd=None):
     if args.action == "set":
-        ai = cfg["ai"]
-        ai["provider"] = args.provider
-        if args.key:
-            ai.setdefault("keys_enc", {})[args.provider] = encrypt_key(args.key)
-        if args.model is not None:
-            ai["model"] = args.model
-        if args.base_url is not None:
-            ai["base_url"] = args.base_url
+        set_ai(cfg, args.provider, args.key or None, args.model, args.base_url)
         config.save(cfg)
         print(f"IA: {args.provider}" + (f" · modelo {args.model}" if args.model else "") + " (clave cifrada con tu usuario de Windows)")
     elif args.action == "off":
@@ -185,6 +180,15 @@ def cmd_vision(args, cfg, gd):
         print('Etiquétalos con: coach vision label <archivo> "<héroe>"')
     elif args.action == "test":
         _vision_test(args, cfg, gd, topbar)
+    elif args.action == "minimap":
+        from PIL import Image
+        from .vision.minimap import minimap_from_image
+        src = Path(args.file or "")
+        if not src.is_file():
+            sys.exit("Uso: coach vision minimap <captura.png>")
+        out = src.with_name(src.stem + "_minimap.png")
+        minimap_from_image(Image.open(src), cfg.get("minimap")).save(out)
+        print(f"Minimapa recortado: {out} (si no cuadra, ajusta la clave 'minimap' de la configuración)")
     elif args.action == "label":
         h = gd.hero(args.hero or "")
         path = Path(args.file)
@@ -213,13 +217,14 @@ def _vision_test(args, cfg, gd, topbar):
         bad = [n for n, h in zip(names, expect) if n and not h]
         if bad:
             sys.exit(f"No reconozco: {', '.join(bad)}")
+    layout = {**topbar.DRAFT_TOPBAR, **(cfg.get("topbar") or {}).get("draft", {})} if args.draft else cfg.get("topbar")
     matcher = topbar.HeroMatcher(gd)
     print(f"{matcher.load()} plantillas · umbral {topbar.MIN_SCORE} · margen {topbar.MIN_MARGIN}")
     hits = total = 0
     for f in files:
         img = Image.open(f)
         print(f"\n{f.name} ({img.width}x{img.height})")
-        for r in topbar.diagnose(matcher, img, cfg.get("topbar"), expect):
+        for r in topbar.diagnose(matcher, img, layout, expect):
             if not r["valid"]:
                 print(f"  {r['slot']}: (vacío u oscuro)")
                 continue
@@ -236,10 +241,51 @@ def _vision_test(args, cfg, gd, topbar):
                 total += 1
                 hits += bool(r["ok"])
         strip = f.with_name(f.stem + "_topbar.png")
-        topbar.strip_image(topbar.tiles_from_image(img, cfg.get("topbar"))).save(strip)
+        topbar.strip_image(topbar.tiles_from_image(img, layout)).save(strip)
         print(f"  recortes: {strip}")
     if total:
         print(f"\nAciertos: {hits}/{total}")
+
+
+def cmd_autostart(args, cfg, gd=None):
+    """Espera a que se abra Dota, lanza el coach y lo cierra al cerrar Dota (lo registra el arranque de Windows)."""
+    from .autostart import run_autostart
+    from .live import run_live
+
+    def start(fresh_cfg, should_stop):
+        data = GameData.load()
+        run_live(fresh_cfg, data, Meta.build(data, fresh_cfg.get("rank_bracket", 0)), should_stop=should_stop)
+    run_autostart(config.load, start)
+
+
+def cmd_report(args, cfg, gd=None):
+    from .engine.matchlog import history, load_reports
+    reports = load_reports(args.last or None)
+    if not reports:
+        sys.exit("Todavía no hay partidas analizadas: juega una con el coach en marcha.")
+    if args.cmd == "history":
+        h = history(reports)
+        print(f"{h.games} partidas · {h.wins} victorias, {h.losses} derrotas · {h.avg_deaths:.1f} muertes de media")
+        print("Héroes (victorias/partidas): " + ", ".join(f"{n} {w}/{g}" for n, g, w in h.heroes))
+        if h.top_death_zone:
+            print(f"Donde más mueres: {h.top_death_zone} · sin enemigos a la vista: {h.fog_death_share:.0%}")
+        for r in h.recurring:
+            print(f"Se repite: {r}")
+        return
+    for r in reports[: args.last or 1]:
+        print(r.summary())
+        if r.lh_at_10 is not None:
+            print(f"  Últimos golpes al minuto 10: {r.lh_at_10}")
+        if r.items:
+            print("  Objetos: " + ", ".join(f"{n} {t // 60}:{t % 60:02d}" for n, t in r.items))
+        for d in r.death_list:
+            who = ", ".join(d.enemies_near) or "nadie a la vista"
+            print(f"  Muerte {d.clock // 60}:{d.clock % 60:02d} en {d.zone} ({who})")
+        for n in r.ai_notes:
+            print(f"  ✦ {n}")
+        for n in r.notes:
+            print(f"  • {n}")
+        print()
 
 
 def cmd_run(args, cfg, gd):
@@ -255,7 +301,13 @@ def main(argv=None):
         pass
     ap = argparse.ArgumentParser(prog="coach", description="Dota Coach: asistente de Dota 2 con el meta del parche actual")
     ap.add_argument("-v", "--verbose", action="store_true")
-    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub = ap.add_subparsers(dest="cmd")  # sin orden: ventana de ajustes
+
+    sub.add_parser("settings", help="ventana de ajustes (también sin argumentos)")
+    sub.add_parser("autostart", help="esperar a que se abra Dota y lanzar el coach (lo usa el arranque de Windows)")
+    for name, helptext in (("report", "informe de tus últimas partidas"), ("history", "resumen de tus partidas")):
+        p = sub.add_parser(name, help=helptext)
+        p.add_argument("--last", type=int, default=0, help="cuántas partidas (por defecto: la última / todas)")
 
     p = sub.add_parser("meta", help="el meta del parche actual")
     p.add_argument("--top", type=int, default=8)
@@ -301,11 +353,12 @@ def main(argv=None):
     p.add_argument("--base-url")
 
     p = sub.add_parser("vision", help="reconocimiento de la barra superior")
-    p.add_argument("action", choices=["strip", "test", "unknown", "label"])
+    p.add_argument("action", choices=["strip", "test", "minimap", "unknown", "label"])
     p.add_argument("file", nargs="?")
     p.add_argument("hero", nargs="?")
     p.add_argument("--out", default="topbar.png")
     p.add_argument("--expect", help="test: los 10 héroes en orden (Radiant 1-5, Dire 1-5); vacío si no se sabe")
+    p.add_argument("--draft", action="store_true", help="test: captura de la selección de héroes (otra barra)")
 
     args = ap.parse_args(argv)
     _setup_logging(args.verbose)
@@ -318,6 +371,13 @@ def main(argv=None):
     if args.cmd == "ai" and args.action == "set" and not args.provider:
         ap.error("indica el proveedor: " + ", ".join(PROVIDER_IDS))
 
+    if args.cmd in (None, "settings"):
+        from .ui.settings import run_settings
+        return run_settings(cfg)
+    if args.cmd == "autostart":
+        return cmd_autostart(args, cfg)
+    if args.cmd in ("report", "history"):
+        return cmd_report(args, cfg)
     if args.cmd in ("install", "uninstall"):
         return cmd_install(args, cfg)
     if args.cmd == "ai":

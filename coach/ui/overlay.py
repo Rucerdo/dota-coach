@@ -54,6 +54,12 @@ class Overlay:
         user32.SetWindowPos(self.hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_FLAGS)
         self.win.after(2000, self._keep_on_top)
 
+    def configure(self, cfg: dict):
+        """Aplica nuevos ajustes (posición, tamaño, letra...) sin recrear la ventana."""
+        self.cfg.update(cfg)
+        self._layout()
+        self._redraw()
+
     def push(self, kind: str, text: str):
         """Thread-safe."""
         self.q.put((kind, text))

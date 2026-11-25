@@ -41,6 +41,7 @@ class Item:
     loc: str                  # Black King Bar
     cost: int = 0
     neutral_tier: int = -1
+    components: list[str] = field(default_factory=list)  # item_* con los que se fabrica (vacío = básico)
 
     @property
     def short(self) -> str:
@@ -112,6 +113,7 @@ class GameData:
             if short in by_short:
                 self._hero_index.setdefault(_norm(alias), by_short[short])
         self._items_by_name = {i.name: i for i in items}
+        self.component_names = {c for i in items for c in i.components}  # se usan para fabricar otro
         self._item_index: dict[str, Item] = {}
         for i in items:
             for key in (i.loc, i.short, i.name):
@@ -171,7 +173,8 @@ class GameData:
                 continue
             od = od_items.get(i["name"].removeprefix("item_"), {})
             items.append(Item(id=i["id"], name=i["name"], loc=i["name_english_loc"],
-                              cost=int(od.get("cost") or 0), neutral_tier=int(i.get("neutral_item_tier", -1))))
+                              cost=int(od.get("cost") or 0), neutral_tier=int(i.get("neutral_item_tier", -1)),
+                              components=[f"item_{c}" for c in od.get("components") or [] if c]))
         abilities = {a["id"]: a["name_english_loc"] or a["name"]
                      for a in abilities_raw["result"]["data"]["itemabilities"] if a.get("id")}
         log.info("datos del juego: %d héroes, %d objetos, %d habilidades", len(heroes), len(items), len(abilities))

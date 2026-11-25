@@ -46,6 +46,18 @@ DEFAULT_TOPBAR = {
     "top": 4,
     "bottom": 39,
 }
+# Barra superior de la SELECCIÓN DE HÉROES (fase de estrategia): retratos el doble de grandes y en otra posición;
+# como en partida, Radiant a la izquierda y Dire a la derecha. Calibrado con una captura real a 1920x1080
+# (10/10 reconocidos, 0.92-0.97).
+DRAFT_TOPBAR = {
+    "radiant_first_center": -692,
+    "dire_first_center": 194,
+    "pitch": 124.2,
+    "half_width": 59,
+    "top": 8,
+    "bottom": 68,
+}
+
 # Parte del retrato que se compara, en fracciones (izq, arriba, der, abajo): la franja de arriba, con la cara.
 # Abajo el HUD pinta encima la insignia de rango (en una esquina) y el rombo verde (en el centro), y los
 # bordes laterales van inclinados y muestran el retrato vecino. Se aplica igual al recorte y a la plantilla.
@@ -263,7 +275,8 @@ class TopbarScanner:
         self._saved_unknown: set[int] = set()
         self._unmatched: set[int] = set()
         self._stop = threading.Event()
-        self.active = threading.Event()  # solo se escanea durante una partida
+        self.active = threading.Event()  # solo se escanea durante una partida o la selección de héroes
+        self.mode = "game"               # game | draft (otra disposición de la barra: ver DRAFT_TOPBAR)
 
     def process(self, tiles: dict[int, Image.Image]) -> dict[int, Hero]:
         """Procesa una lectura de los 10 recortes. Devuelve los héroes confirmados nuevos por slot."""
@@ -309,8 +322,18 @@ class TopbarScanner:
             tile.convert("RGB").save(unknown_dir() / f"{int(time.time())}_slot{pid}.png")
             self._saved_unknown.add(pid)
 
+    def set_mode(self, mode: str):
+        """Cambia entre la barra de partida y la de la selección. Lo confirmado se olvida: son recortes de otra
+        pantalla y conviene volver a confirmarlos."""
+        if mode != self.mode:
+            self.mode = mode
+            self.reset()
+
+    def layout(self) -> dict | None:
+        return {**DRAFT_TOPBAR, **(self.cfg or {}).get("draft", {})} if self.mode == "draft" else self.cfg
+
     def scan_once(self) -> dict[int, Hero]:
-        tiles = capture_tiles(self.cfg)
+        tiles = capture_tiles(self.layout())
         return self.process(tiles) if tiles else {}
 
     def reset(self):
@@ -328,7 +351,7 @@ class TopbarScanner:
                         self.on_heroes(dict(self.confirmed))
                 except Exception:
                     log.exception("error leyendo la barra superior")
-            self._stop.wait(self.interval)
+            self._stop.wait(self.interval if self.mode == "game" else min(self.interval, 3.0))
 
     def start(self):
         if self.matcher.matrix is None:

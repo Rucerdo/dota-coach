@@ -3,3 +3,4 @@ anthropic>=2.0
 pillow>=10.0
 numpy>=1.26
 comtypes>=1.4
+customtkinter>=5.2

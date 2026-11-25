@@ -39,9 +39,9 @@ def advantage(wins_of_enemy: int, games: int) -> float:
 
 
 def suggest_picks(gd: GameData, enemies: list[Hero], allies: list[Hero] = (), role: str = "auto",
-                  meta=None, matchups: Callable[[int], list[dict]] | None = None, limit: int = 8
-                  ) -> list[PickSuggestion]:
-    taken = {h.id for h in [*enemies, *allies]}
+                  meta=None, matchups: Callable[[int], list[dict]] | None = None, limit: int = 8,
+                  banned: list[Hero] = ()) -> list[PickSuggestion]:
+    taken = {h.id for h in [*enemies, *allies, *banned]}
     tables: dict[int, dict[int, tuple[int, int]]] = {}
     for e in enemies:
         try:

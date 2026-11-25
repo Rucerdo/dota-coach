@@ -18,7 +18,8 @@ PRESETS = {
     "openai": dict(label="ChatGPT (OpenAI)", base="https://api.openai.com/v1",
                    prefer=[r"^gpt-\d+(\.\d+)?-mini$", r"^gpt-\d+(\.\d+)?$"], reasoning=r"^(gpt-[5-9]|o\d)"),
     "gemini": dict(label="Gemini (Google)", base="https://generativelanguage.googleapis.com/v1beta/openai",
-                   prefer=[r"gemini-[\d.]+-flash$", r"gemini.*flash", r"gemini"], reasoning=r"gemini-[2-9]"),
+                   prefer=[r"^gemini-[\d.]+-flash$", r"^gemini-[\d.]+-flash-lite$", r"gemini.*flash", r"gemini"],
+                   reasoning=r"gemini-[2-9]"),
     "groq": dict(label="Groq", base="https://api.groq.com/openai/v1",
                  prefer=[r"^openai/gpt-oss-120b$", r"gpt-oss", r"^llama"], reasoning=r"gpt-oss|qwen3"),
     "openrouter": dict(label="OpenRouter", base="https://openrouter.ai/api/v1", prefer=[],
@@ -29,6 +30,17 @@ PRESETS = {
                    reasoning=None, needs_key=False),
 }
 _SKIP = re.compile(r"audio|realtime|transcribe|tts|whisper|embed|image|moderation|search|guard|vision|codex", re.I)
+_OVERLOADED = (500, 502, 503, 504)  # el modelo está saturado o caído: se prueba el siguiente candidato
+_MAX_MODEL_SWITCHES = 3
+
+
+def _version_key(model_id: str) -> tuple:
+    """Orden natural: las versiones más nuevas primero y las 'preview'/'exp' detrás de las estables."""
+    nums = tuple(int(n) for n in re.findall(r"\d+", model_id))
+    unstable = bool(re.search(r"preview|exp", model_id))
+    return (not unstable, nums)
+
+
 _EFFORT = {"low": "low", "medium": "medium", "high": "high", "xhigh": "high", "max": "high"}
 
 
@@ -43,6 +55,7 @@ class OpenAICompat(Provider):
         self._session = requests.Session()
         self._lock = threading.Lock()
         self._chosen = ""
+        self._candidates: list[str] = []  # modelos elegibles, del preferido al último recurso
         self._unsupported: set[str] = set()
 
     def _headers(self):
@@ -66,12 +79,15 @@ class OpenAICompat(Provider):
             except (requests.RequestException, ValueError) as e:
                 raise LLMError(f"{self.label}: no se pudo listar los modelos ({e})") from e
             ids = [i.removeprefix("models/") for i in ids if i and not _SKIP.search(i)]
+            candidates: list[str] = []
             for pat in self._prefer:
-                matches = sorted((i for i in ids if re.search(pat, i)), reverse=True)
-                if matches:
-                    chosen = matches[0]
-                    break
-            chosen = chosen or (ids[0] if ids else "")
+                for i in sorted((i for i in ids if re.search(pat, i)), key=_version_key, reverse=True):
+                    if i not in candidates:
+                        candidates.append(i)
+            candidates = candidates or ids[:1]
+            chosen = candidates[0] if candidates else ""
+            with self._lock:
+                self._candidates = candidates
         if not chosen:
             raise LLMError(f"{self.label}: no hay modelos disponibles; indica uno en la configuración")
         with self._lock:
@@ -79,8 +95,30 @@ class OpenAICompat(Provider):
         log.info("%s: modelo %s", self.label, chosen)
         return chosen
 
+    def _switch_model(self, failed: str) -> str | None:
+        """Pasa al siguiente candidato tras 'failed' (solo con el modelo automático). None si no quedan."""
+        if self.model:
+            return None
+        with self._lock:
+            rest = self._candidates[self._candidates.index(failed) + 1:] if failed in self._candidates else []
+            if not rest:
+                return None
+            self._chosen = rest[0]
+        log.warning("%s: %s no responde; se prueba %s", self.label, failed, rest[0])
+        return rest[0]
+
     def complete(self, system, user, schema=None, effort="low", max_tokens=4000, timeout=60.0):
         model = self.resolved_model()
+        for _ in range(_MAX_MODEL_SWITCHES):
+            r = self._request(model, system, user, schema, effort, max_tokens, timeout)
+            if r.status_code not in _OVERLOADED:
+                break
+            model = self._switch_model(model) or ""
+            if not model:
+                break
+        return self._parse(r)
+
+    def _request(self, model, system, user, schema, effort, max_tokens, timeout) -> requests.Response:
         body = {"model": model, "max_completion_tokens": max_tokens,
                 "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
         if schema and "response_format" not in self._unsupported:
@@ -107,6 +145,9 @@ class OpenAICompat(Provider):
                         body["max_tokens"] = value
                     continue
             break
+        return r
+
+    def _parse(self, r: requests.Response) -> str:
         if r.status_code in (401, 403):
             self.pause(600)
             raise LLMError(f"clave de {self.label} no válida")

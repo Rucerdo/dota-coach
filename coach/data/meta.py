@@ -44,13 +44,19 @@ class HeroMeta:
         """Positivo = fuerte ahora mismo. Mezcla winrate, tendencia y cambios del parche."""
         return (self.winrate - 0.5) * 100 + 0.5 * self.trend + 0.4 * self.patch_score
 
+    @property
+    def verdict(self) -> str:
+        """buff | nerf | mixto | rework... según la IA o el saldo de cambios; "" si el parche no lo toca."""
+        if not self.changes:
+            return ""
+        return self.ai_verdict or ("buff" if self.patch_score > 0.5 else "nerf" if self.patch_score < -0.5 else "mixto")
+
     def one_line(self) -> str:
         parts = [f"{self.hero.loc}: {self.winrate:.1%} WR"]
         if self.trend:
             parts.append(f"tendencia {self.trend:+.1f} pts")
         if self.changes:
-            verdict = self.ai_verdict or ("buff" if self.patch_score > 0.5 else "nerf" if self.patch_score < -0.5 else "mixto")
-            parts.append(f"parche: {verdict} ({len(self.changes)} cambios)")
+            parts.append(f"parche: {self.verdict} ({len(self.changes)} cambios)")
         if self.ai_summary:
             parts.append(self.ai_summary)
         return " · ".join(parts)

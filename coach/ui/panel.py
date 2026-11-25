@@ -1,0 +1,1143 @@
+"""Panel de partida (ventana aparte, al estilo de Dota Plus) en formato apaisado:
+
+  cabecera ─ tu héroe, estadísticas, reloj y estado
+  izquierda ─ tu inventario, siguiente compra (con sus componentes) y build por fases
+  centro ─ líneas, enemigos (rasgos, meta y qué comprar contra cada uno) y partidas parecidas
+  derecha ─ minimapa, últimos consejos y tu héroe en el parche
+
+Todo cabe sin scroll en ~1400x880: los textos largos van en tooltips.
+
+Es la ventana principal del modo en directo: cerrarla detiene el coach. Todo llega por post() desde otros hilos
+y se pinta en el hilo de Tk. Los widgets se crean una vez y solo se reconfiguran cuando su valor cambia: nada se
+destruye y se vuelve a crear, así que no parpadea.
+"""
+import logging
+import queue
+import threading
+import time
+import tkinter as tk
+
+import customtkinter as ctk
+from PIL import Image
+
+from .. import config
+from ..data.cache import download_file
+from ..data.gamedata import CDN, Hero
+from ..engine.benchmarks import describe
+from ..engine.counters import PHASE_LABELS, PHASES
+from ..engine.timers import upcoming
+from .toast import ToastManager
+from .view import HeroCard, ItemCard, MatchView
+
+log = logging.getLogger(__name__)
+
+BG, CARD, CARD2 = "#0E1217", "#1A212A", "#222B36"
+TEXT, MUTED, ACCENT = "#E6EAEE", "#8B96A3", "#C8402B"
+GREEN, YELLOW, RED, CYAN, GOLD = "#5FCF80", "#F2C94C", "#E5534B", "#4FC3F7", "#F5C542"
+KIND_COLORS = {"item": GOLD, "counter": "#FF7A59", "play": CYAN, "warning": RED, "status": MUTED, "map": RED,
+               "timer": "#B39DDB"}
+KIND_LABELS = {"item": "COMPRA", "counter": "COUNTER", "play": "JUEGO", "warning": "AVISO", "status": "INFO",
+               "map": "MAPA", "timer": "TIEMPO"}
+TIMER_SHORT = {"bounty": "Recompensa", "power": "Poder", "wisdom": "Sabiduría", "lotus": "Loto", "stack": "Stack",
+               "daynight": "Día/noche"}
+VERDICT_COLORS = {"buff": GREEN, "nerf": RED}
+# Tono del panel: neutro fuera de partida, cálido de día y azulado de noche (transición suave)
+PALETTES = {
+    "neutral": {"bg": "#0E1217", "card": "#1A212A", "header": "#1A212A", "clock": "#E6EAEE"},
+    "day": {"bg": "#13110D", "card": "#221D16", "header": "#2A2219", "clock": "#F5C542"},
+    "night": {"bg": "#090E1A", "card": "#121A2B", "header": "#152038", "clock": "#9FC3FF"},
+}
+TOAST_ICONS = {"mia": "?", "near": "⚔", "tp": "↯", "tower": "♜", "streak": "☠"}
+MAX_TIPS = 60
+
+
+def _mix(a: str, b: str, t: float) -> str:
+    a_, b_ = [int(a[i:i + 2], 16) for i in (1, 3, 5)], [int(b[i:i + 2], 16) for i in (1, 3, 5)]
+    return "#" + "".join(f"{round(x + (y - x) * t):02x}" for x, y in zip(a_, b_))
+TIP_ROWS = 5
+
+
+def font(size=13, weight="normal"):
+    return ctk.CTkFont(family="Segoe UI", size=size, weight=weight)
+
+
+def fmt_clock(seconds: int) -> str:
+    sign = "-" if seconds < 0 else ""
+    seconds = abs(int(seconds))
+    return f"{sign}{seconds // 60}:{seconds % 60:02d}"
+
+
+def panel_geometry(saved: str, default_size: str = "1400x880") -> str:
+    """La geometría guardada; si era la del panel vertical antiguo (estrecho), se amplía conservando la posición
+    (p. ej. en el segundo monitor)."""
+    import re
+    m = re.fullmatch(r"(\d+)x(\d+)([+-]-?\d+[+-]-?\d+)?", saved.strip())
+    if not m:
+        return default_size
+    if int(m.group(1)) >= 1000:
+        return saved
+    return default_size + (m.group(3) or "")
+
+
+# ================= utilidades de widgets =================
+_last: dict[int, dict] = {}
+
+
+def setw(widget, **kw):
+    """configure() solo con lo que ha cambiado (evita redibujos y parpadeos)."""
+    prev = _last.setdefault(id(widget), {})
+    changed = {k: v for k, v in kw.items() if prev.get(k, object()) is not v and prev.get(k, object()) != v}
+    if changed:
+        widget.configure(**changed)
+        prev.update(changed)
+
+
+def show(widget, visible: bool, **grid):
+    """Coloca u oculta con grid. Se mira si está COLOCADO (winfo_manager), no si se ve (winfo_ismapped): Tk
+    desmapea lo que queda fuera de la vista y eso hacía recolocarlo sin parar (parpadeo)."""
+    placed = bool(widget.winfo_manager())
+    if visible and not placed:
+        widget.grid(**grid) if grid else widget.grid()
+    elif not visible and placed:
+        widget.grid_remove()
+
+
+def pack_show(widget, visible: bool, **pack):
+    placed = bool(widget.winfo_manager())
+    if visible and not placed:
+        widget.pack(**pack)
+    elif not visible and placed:
+        widget.pack_forget()
+
+
+class Tooltip:
+    """Texto al pasar el ratón (motivos de cada objeto)."""
+
+    def __init__(self, widget):
+        self.widget, self.text, self.tip = widget, "", None
+        widget.bind("<Enter>", self._show, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+
+    def _show(self, _e=None):
+        if not self.text or self.tip:
+            return
+        x, y = self.widget.winfo_rootx() + 10, self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+        self.tip = tk.Toplevel(self.widget)
+        self.tip.overrideredirect(True)
+        self.tip.attributes("-topmost", True)
+        self.tip.geometry(f"+{x}+{y}")
+        tk.Label(self.tip, text=self.text, bg=CARD2, fg=TEXT, font=("Segoe UI", 10), justify="left",
+                 wraplength=360, padx=8, pady=6).pack()
+
+    def _hide(self, _e=None):
+        if self.tip:
+            self.tip.destroy()
+            self.tip = None
+
+
+class ImageStore:
+    """Retratos e iconos: del disco si ya están; si no, se descargan en segundo plano (una vez)."""
+
+    def __init__(self):
+        self._q: queue.Queue = queue.Queue()
+        self._pending: set = set()
+        self._images: dict = {}
+        self.changed = threading.Event()
+        threading.Thread(target=self._worker, daemon=True).start()
+
+    def _worker(self):
+        while True:
+            url, path = self._q.get()
+            if download_file(url, path):
+                self.changed.set()
+
+    def _get(self, url: str, path, size: tuple[int, int]):
+        key = (str(path), size)
+        if key in self._images:
+            return self._images[key]
+        if path.exists():
+            try:
+                img = Image.open(path).convert("RGBA")
+            except OSError:
+                return None
+            self._images[key] = ctk.CTkImage(light_image=img, dark_image=img, size=size)
+            return self._images[key]
+        if path not in self._pending:
+            self._pending.add(path)
+            self._q.put((url, path))
+        return None
+
+    def hero(self, hero: Hero, size=(64, 36)):
+        if not hero.img:
+            return None
+        return self._get(CDN + hero.img.split("?")[0], config.CACHE_DIR / "hero_img" / f"{hero.short}.png", size)
+
+    def item(self, short: str, size=(44, 32)):
+        return self._get(f"{CDN}/apps/dota2/images/dota_react/items/{short}.png",
+                         config.CACHE_DIR / "item_img" / f"{short}.png", size)
+
+
+class Pool:
+    """Filas reutilizables: crea las que falten, oculta las que sobren y reconfigura el resto."""
+
+    def __init__(self, factory):
+        self.factory, self.rows = factory, []
+
+    def update(self, values: list, setter):
+        while len(self.rows) < len(values):
+            self.rows.append(self.factory(len(self.rows)))
+        for i, row in enumerate(self.rows):
+            if i < len(values):
+                setter(row, values[i])
+                show(row["frame"], True)
+            else:
+                show(row["frame"], False)
+
+
+# ================= panel =================
+class Panel(ctk.CTk):
+    def __init__(self, cfg: dict, patch: str, ai_label: str):
+        super().__init__(fg_color=BG)
+        ctk.set_appearance_mode("dark")
+        self.cfg = cfg
+        pcfg = cfg.get("panel", {})
+        self.title("Dota Coach")
+        self.minsize(1000, 600)
+        self._place(pcfg)
+        self.attributes("-topmost", bool(pcfg.get("on_top", False)))
+        self.patch, self.ai_label = patch, ai_label
+        self.q: queue.Queue = queue.Queue()
+        self.images = ImageStore()
+        self.view: MatchView | None = None
+        self.similar = None
+        self.draft = None
+        self.toast = ToastManager(self, cfg.get("toasts_position", "game"))
+        self.theme = "neutral"
+        self._theme_colors = dict(PALETTES["neutral"])
+        self._themed: list[tuple[object, str]] = [(self, "bg")]
+        self.report = None
+        self.history = None
+        self.view_time = 0.0
+        self.item_names: dict[str, str] = {}   # item_* → nombre (para inventario y alijo)
+        self.minimap_frame = None      # último fotograma del minimapa (PIL), lo pone otro hilo
+        self._minimap_shown = None
+        self.similar_state = ""  # "" | "buscando" | "sin datos"
+        self.last_state = 0.0
+        self.tips: list = []
+        self._tips_shown = -1
+
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(1, weight=1)
+        self._build_header()
+        cols = ctk.CTkFrame(self, fg_color="transparent")
+        cols.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 8))
+        cols.grid_rowconfigure(0, weight=1)
+        self.cols = []
+        for i in range(3):
+            cols.grid_columnconfigure(i, weight=1, uniform="col")
+            sc = ctk.CTkFrame(cols, fg_color="transparent")
+            sc.grid(row=0, column=i, sticky="nsew", padx=4)
+            sc.grid_columnconfigure(0, weight=1)
+            self.cols.append(sc)
+        self.cards = {}
+        self._build_draft(self._card(0, "draft", "Selección de héroes"))
+        self._build_report(self._card(0, "report", "Tu última partida"))
+        self._build_history(self._card(0, "history", "Tus partidas"))
+        self._build_inventory(self._card(0, "inventory", "Tu inventario"))
+        self._build_next(self._card(0, "next", "Siguiente compra"))
+        self._build_phases(self._card(0, "phases", "Build por fases"))
+        self._build_battle(self._card(0, "battle", "Torres y bajas"))
+        self._build_lanes(self._card(1, "lanes", "Líneas"))
+        self._build_enemies(self._card(1, "enemies", "Enemigos"))
+        self._build_similar(self._card(1, "similar", "Partidas parecidas"))
+
+        self._build_map(self._card(2, "map", "Mapa"))
+        self._build_tips(self._card(2, "tips", "Últimos consejos"))
+        self._build_patch(self._card(2, "patch", "Tu héroe en el parche"))
+        self._render()
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.after(250, self._poll)
+
+    def _place(self, pcfg: dict):
+        """Por defecto, maximizado en la pantalla secundaria si la hay (el juego va en la principal); con
+        panel.screen = "saved", donde se dejó la última vez."""
+        if pcfg.get("screen", "secondary") == "secondary":
+            from .monitors import list_monitors, preferred_monitor
+            mon = preferred_monitor(list_monitors())
+            if mon:
+                self.geometry(mon.geometry)
+                self.after(150, lambda: self.state("zoomed"))
+                return
+        self.geometry(panel_geometry(pcfg.get("geometry") or ""))
+
+    # ---------- entrada (cualquier hilo) ----------
+    def post(self, kind: str, payload=None):
+        self.q.put((kind, payload))
+
+    # ---------- estructura ----------
+    def _card(self, col: int, key: str, title: str) -> ctk.CTkFrame:
+        parent = self.cols[col]
+        card = ctk.CTkFrame(parent, fg_color=CARD, corner_radius=10)
+        card.grid(row=len(parent.winfo_children()), column=0, sticky="ew", pady=(0, 8))
+        card.grid_columnconfigure(0, weight=1)
+        head = ctk.CTkFrame(card, fg_color="transparent")
+        head.grid(row=0, column=0, sticky="ew", padx=12, pady=(8, 2))
+        ctk.CTkLabel(head, text=title.upper(), font=font(11, "bold"), text_color=MUTED).pack(side="left")
+        extra = ctk.CTkLabel(head, text="", font=font(11), text_color=MUTED)
+        extra.pack(side="right")
+        body = ctk.CTkFrame(card, fg_color="transparent")
+        body.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 8))
+        body.grid_columnconfigure(0, weight=1)
+        empty = ctk.CTkLabel(body, text="", font=font(11), text_color=MUTED, wraplength=400, justify="left",
+                             anchor="w")
+        self.cards[key] = {"body": body, "extra": extra, "empty": empty, "frame": card}
+        self._themed.append((card, "card"))
+        return body
+
+    def _show_card(self, key: str, visible: bool):
+        show(self.cards[key]["frame"], visible)
+
+    def _empty(self, key: str, text: str | None):
+        """Muestra u oculta el texto de "sin datos" de una tarjeta."""
+        lbl = self.cards[key]["empty"]
+        if text:
+            setw(lbl, text=text)
+            show(lbl, True, row=99, column=0, columnspan=4, sticky="ew")
+        else:
+            show(lbl, False)
+
+    # ---------- cabecera ----------
+    def _build_header(self):
+        h = ctk.CTkFrame(self, fg_color=CARD, corner_radius=0)
+        h.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        self._themed.append((h, "header"))
+        h.grid_columnconfigure(2, weight=1)
+        self.h_portrait = ctk.CTkLabel(h, text="", width=112, height=63, fg_color=CARD2, corner_radius=6)
+        self.h_portrait.grid(row=0, column=0, rowspan=2, padx=(14, 12), pady=12)
+        names = ctk.CTkFrame(h, fg_color="transparent")
+        names.grid(row=0, column=1, rowspan=2, sticky="w")
+        self.h_name = ctk.CTkLabel(names, text="Dota Coach", font=font(20, "bold"), text_color=TEXT, anchor="w")
+        self.h_name.pack(anchor="w")
+        self.h_sub = ctk.CTkLabel(names, text="", font=font(12), text_color=MUTED, anchor="w")
+        self.h_sub.pack(anchor="w")
+
+        stats = ctk.CTkFrame(h, fg_color="transparent")
+        stats.grid(row=0, column=2, rowspan=2, padx=16)
+        self.stat_labels = {}
+        self.stat_subs = {}
+        for i, (key, label) in enumerate([("kda", "V/M/A"), ("lh", "Últimos"), ("gpm", "Oro/min"),
+                                          ("gold", "Oro"), ("bb", "Buyback")]):
+            box = ctk.CTkFrame(stats, fg_color=CARD2, corner_radius=6, width=92)
+            box.grid(row=0, column=i, padx=3)
+            val = ctk.CTkLabel(box, text="–", font=font(16, "bold"), text_color=TEXT, width=86)
+            val.pack(pady=(6, 0))
+            sub = ctk.CTkLabel(box, text=label, font=font(10), text_color=MUTED)
+            sub.pack(pady=(0, 6))
+            self.stat_labels[key] = val
+            self.stat_subs[key] = (sub, label)
+
+        right = ctk.CTkFrame(h, fg_color="transparent")
+        right.grid(row=0, column=3, rowspan=2, padx=14, sticky="e")
+        clock = ctk.CTkFrame(right, fg_color="transparent")
+        clock.pack(anchor="e")
+        self.h_clock = ctk.CTkLabel(clock, text="--:--", font=font(26, "bold"), text_color=TEXT)
+        self.h_clock.pack(side="right")
+        self.h_day = ctk.CTkLabel(clock, text="", font=font(12), text_color=MUTED)
+        self.h_day.pack(side="right", padx=(0, 10))
+        self.h_status = ctk.CTkLabel(right, text="", font=font(11), text_color=MUTED)
+        self.h_status.pack(anchor="e")
+        self.h_timers = ctk.CTkLabel(h, text="", font=font(11), text_color="#B39DDB", anchor="w")
+        self.v_top = tk.BooleanVar(value=bool(self.cfg.get("panel", {}).get("on_top", False)))
+        ctk.CTkCheckBox(right, text="Siempre encima", variable=self.v_top, font=font(11), checkbox_width=16,
+                        checkbox_height=16, fg_color=ACCENT, hover_color=ACCENT, command=self._toggle_top).pack(
+            anchor="e", pady=(4, 0))
+
+    def _toggle_top(self):
+        self.attributes("-topmost", bool(self.v_top.get()))
+
+    def _render_header(self):
+        v = self.view
+        if not self.last_state:
+            status, color = "● Esperando a Dota… (si ya estaba abierto, reinícialo tras instalar GSI)", YELLOW
+        elif time.time() - self.last_state > 10:
+            status, color = "● Sin datos de Dota", YELLOW
+        elif v and v.in_game:
+            status, color = "● En partida", GREEN
+        else:
+            status, color = "● Conectado · esperando partida", GREEN
+        setw(self.h_status, text=f"{status}   ·   parche {self.patch}   ·   {self.ai_label}", text_color=color)
+        if not v:
+            return
+        if v.hero:
+            setw(self.h_name, text=v.hero.loc)
+            img = self.images.hero(v.hero, (112, 63))
+            setw(self.h_portrait, image=img, text="" if img else v.hero.loc[:2])
+        team = {"radiant": "Radiant", "dire": "Dire"}.get(v.team, "")
+        sub = [f"Nivel {v.level}" if v.level else "", team, v.role]
+        if not v.alive:
+            sub.append(f"muerto · reaparece en {v.respawn_seconds}s")
+        setw(self.h_sub, text=" · ".join(s for s in sub if s), text_color=MUTED if v.alive else RED)
+        setw(self.h_clock, text=fmt_clock(v.clock) if v.in_game else "--:--")
+        score = f"   Radiant {v.radiant_score} – {v.dire_score} Dire" if v.in_game else ""
+        setw(self.h_day, text=(("☀ día" if v.daytime else "☾ noche") + score) if v.in_game else "")
+        setw(self.stat_labels["kda"], text=f"{v.kills}/{v.deaths}/{v.assists}")
+        setw(self.stat_labels["lh"], text=str(v.last_hits))
+        setw(self.stat_labels["gpm"], text=str(v.gpm))
+        setw(self.stat_labels["gold"], text=str(v.gold), text_color=GOLD)
+        setw(self.stat_labels["bb"], text=str(v.buyback_cost) if v.buyback_cost else "–",
+             text_color=GREEN if v.gold >= v.buyback_cost > 0 else TEXT)
+        for key, metric in (("gpm", "gold_per_min"), ("lh", "last_hits_per_min")):
+            sub, label = self.stat_subs[key]
+            p = v.percentiles.get(metric)
+            if p is None:
+                setw(sub, text=label, text_color=MUTED)
+            else:
+                setw(sub, text=f"{label} · {describe(p)}",
+                     text_color=GREEN if p >= 0.6 else RED if p <= 0.3 else MUTED)
+        if v.in_game and v.clock >= 0:
+            clock = v.clock + int(time.time() - self.view_time)  # avanza entre envíos de Dota
+            parts = [f"{TIMER_SHORT[t.key]} {fmt_clock(t.seconds_left)}" for t in upcoming(clock)]
+            setw(self.h_timers, text="⏱  " + "   ·   ".join(parts))
+            show(self.h_timers, True, row=2, column=0, columnspan=4, sticky="w", padx=14, pady=(0, 8))
+        else:
+            show(self.h_timers, False)
+
+    # ---------- tono día / noche ----------
+    def _render_theme(self):
+        v = self.view
+        want = ("day" if v.daytime else "night") if v and v.in_game else "neutral"
+        if want == self.theme:
+            return
+        self.theme = want
+        start, end = dict(self._theme_colors), PALETTES[want]
+
+        def step(i=1, steps=12):
+            t = i / steps
+            colors = {k: _mix(start[k], end[k], t) for k in ("bg", "card", "header")}
+            for widget, role in self._themed:
+                try:
+                    widget.configure(fg_color=colors[role])
+                except Exception:
+                    pass
+            self._theme_colors.update(colors)
+            if i < steps:
+                self.after(50, step, i + 1)
+            else:
+                self._theme_colors["clock"] = end["clock"]
+                setw(self.h_clock, text_color=end["clock"])
+        step()
+
+    # ---------- torres y bajas ----------
+    def _build_battle(self, body):
+        body.grid_columnconfigure(1, weight=1)
+        self.b_towers = {}
+        for i, lane in enumerate(("top", "mid", "bot")):
+            ctk.CTkLabel(body, text=lane.capitalize(), font=font(11, "bold"), text_color=MUTED, width=36,
+                         anchor="w", height=20).grid(row=i, column=0, sticky="w")
+            strip = ctk.CTkFrame(body, fg_color="transparent")
+            strip.grid(row=i, column=1, sticky="w", pady=1)
+            self.b_towers[lane] = [ctk.CTkLabel(strip, text="", font=font(10, "bold"), width=70, height=20,
+                                                fg_color=CARD2, corner_radius=4) for _ in range(3)]
+            for j, lbl in enumerate(self.b_towers[lane]):
+                lbl.grid(row=0, column=j, padx=(0, 4))
+        self.b_streak = ctk.CTkLabel(body, text="", font=font(11, "bold"), text_color=RED, anchor="w")
+        self.b_streak.grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+        def factory(i):
+            f = ctk.CTkFrame(body, fg_color="transparent")
+            f.grid(row=10 + i, column=0, columnspan=2, sticky="w", pady=1)
+            when = ctk.CTkLabel(f, text="", font=font(10), text_color=MUTED, width=38, anchor="w", height=22)
+            when.pack(side="left")
+            killer, ktip = self._hero_icon(f, (40, 22))
+            killer.pack(side="left")
+            arrow = ctk.CTkLabel(f, text="→", font=font(12, "bold"), width=22, height=22)
+            arrow.pack(side="left")
+            victim, vtip = self._hero_icon(f, (40, 22))
+            victim.pack(side="left")
+            text = ctk.CTkLabel(f, text="", font=font(10), text_color=MUTED, anchor="w", height=22)
+            text.pack(side="left", padx=(6, 0))
+            return {"frame": f, "when": when, "killer": killer, "ktip": ktip, "arrow": arrow, "victim": victim,
+                    "vtip": vtip, "text": text}
+        self.kill_pool = Pool(factory)
+        self.b_buys = ctk.CTkLabel(body, text="", font=font(10), text_color=MUTED, anchor="w", wraplength=410,
+                                   justify="left")
+        self.b_buys.grid(row=30, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
+    def _set_kill(self, row, k):
+        setw(row["when"], text=fmt_clock(k.clock))
+        for key, tip, hero in (("killer", "ktip", k.killer), ("victim", "vtip", k.victim)):
+            img = self.images.hero(hero, (40, 22)) if hero else None
+            setw(row[key], image=img, text="" if img else (hero.loc[:2] if hero else "?"))
+            row[tip].text = hero.loc if hero else "desconocido"
+        color = RED if k.killer_enemy else GREEN if k.killer_enemy is False else MUTED
+        setw(row["arrow"], text_color=color)
+        names = f"{k.killer.loc if k.killer else '?'} mató a {k.victim.loc if k.victim else '?'}"
+        setw(row["text"], text=names if len(names) <= 40 else names[:38] + "…")
+
+    def _render_battle(self):
+        v = self.view
+        ev = v.events if v else None
+        towers = dict(ev.towers) if ev else {}
+        for lane, labels in self.b_towers.items():
+            for tier, lbl in zip((1, 2, 3), labels):
+                frac = towers.get(f"T{tier} {lane}")
+                if frac is None:
+                    setw(lbl, text=f"T{tier} –", text_color=MUTED, fg_color=CARD2)
+                elif frac <= 0:
+                    setw(lbl, text=f"T{tier} caída", text_color="#7A8591", fg_color=BG)
+                else:
+                    color = GREEN if frac > 0.6 else GOLD if frac > 0.3 else RED
+                    setw(lbl, text=f"T{tier} {frac:.0%}", text_color=color, fg_color=CARD2)
+        streaks = sorted((ev.streaks if ev else {}).items(), key=lambda kv: -kv[1])
+        setw(self.b_streak, text=("Rachas: " + ", ".join(f"{h} {n}" for h, n in streaks[:3])) if streaks else "")
+        kills = list(reversed(ev.kills[-4:])) if ev else []
+        self.kill_pool.update(kills, self._set_kill)
+        buys = ev.purchases[-3:] if ev else []
+        setw(self.b_buys, text=("Compras de aliados: " + " · ".join(f"{h}: {i}" for _, h, i in reversed(buys)))
+             if buys else "")
+        has = bool(towers or kills or buys)
+        self._empty("battle", None if has else "Tus torres, quién mata a quién y las rachas aparecerán aquí "
+                                               "durante la partida.")
+        if v and v.in_game:
+            setw(self.cards["battle"]["extra"], text=f"Radiant {v.radiant_score} – {v.dire_score} Dire")
+
+    # ---------- modo de la columna izquierda ----------
+    def _render_mode(self):
+        v = self.view
+        drafting = bool(v and v.drafting)
+        playing = bool(v and v.in_game) and not drafting
+        idle = not drafting and not playing
+        self._show_card("draft", drafting)
+        for key in ("inventory", "next", "phases", "battle"):
+            self._show_card(key, playing)
+        self._show_card("report", idle and self.report is not None)
+        self._show_card("history", idle)
+
+    # ---------- draft ----------
+    def _build_draft(self, body):
+        body.grid_columnconfigure(1, weight=1)
+        self.d_rows = {}
+        for i, (key, title) in enumerate((("allies", "Tu equipo"), ("enemies", "Rivales"), ("bans", "Baneados"))):
+            ctk.CTkLabel(body, text=title, font=font(11, "bold"), text_color=MUTED, width=76, anchor="w").grid(
+                row=i, column=0, sticky="w", pady=2)
+            strip = ctk.CTkFrame(body, fg_color="transparent")
+            strip.grid(row=i, column=1, sticky="w", pady=2)
+            self.d_rows[key] = [self._hero_icon(strip, (48, 27)) for _ in range(5 if key != "bans" else 7)]
+        self.d_title = ctk.CTkLabel(body, text="", font=font(12, "bold"), text_color=TEXT, anchor="w")
+        self.d_title.grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 2))
+
+        def factory(i):
+            f = ctk.CTkFrame(body, fg_color=CARD2, corner_radius=6)
+            f.grid(row=4 + i, column=0, columnspan=2, sticky="ew", pady=(0, 4))
+            f.grid_columnconfigure(1, weight=1)
+            portrait = ctk.CTkLabel(f, text="", width=64, height=36, fg_color=BG, corner_radius=4)
+            portrait.grid(row=0, column=0, rowspan=2, padx=6, pady=4)
+            name = ctk.CTkLabel(f, text="", font=font(13, "bold"), text_color=TEXT, anchor="w", height=18)
+            name.grid(row=0, column=1, sticky="w")
+            why = ctk.CTkLabel(f, text="", font=font(10), text_color=MUTED, anchor="w", height=16)
+            why.grid(row=1, column=1, sticky="w")
+            score = ctk.CTkLabel(f, text="", font=font(13, "bold"), text_color=GREEN, width=50)
+            score.grid(row=0, column=2, rowspan=2, padx=8)
+            return {"frame": f, "portrait": portrait, "name": name, "why": why, "score": score,
+                    "tip": Tooltip(why)}
+        self.pick_pool = Pool(factory)
+
+    def _set_pick(self, row, p):
+        img = self.images.hero(p.hero, (64, 36))
+        setw(row["portrait"], image=img, text="" if img else p.hero.loc[:2])
+        setw(row["name"], text=p.hero.loc)
+        best = sorted(p.vs.items(), key=lambda kv: -kv[1])
+        good = ", ".join(f"{k} {v:+.1f}" for k, v in best[:2] if v > 0.5)
+        line = (f"bien contra {good}" if good else "") + (" · " if good and p.meta_line else "") + \
+            (p.meta_line.split(" · ")[0] if p.meta_line else "")
+        setw(row["why"], text=line if len(line) <= 60 else line[:58] + "…")
+        row["tip"].text = p.line()
+        setw(row["score"], text=f"{p.score:+.1f}", text_color=GREEN if p.score > 0 else RED)
+
+    def _render_draft(self):
+        d = self.draft
+        if not (self.view and self.view.drafting):
+            return
+        for key, icons in self.d_rows.items():
+            heroes = getattr(d, key) if d else []
+            self._set_icons(icons, heroes, self.images, {"allies": GREEN, "enemies": RED}.get(key, CARD2))
+        if not d:
+            self._empty("draft", "Esperando a ver los héroes elegidos…")
+            self.pick_pool.update([], self._set_pick)
+            setw(self.d_title, text="")
+            return
+        self._empty("draft", None if d.picks else
+                    ("Cuando se vea algún héroe rival, aquí saldrán los mejores picks contra ellos."
+                     if not d.enemies else "Calculando…"))
+        turn = "  ·  ¡te toca elegir!" if d.my_turn else ""
+        setw(self.d_title, text=("Mejores picks contra sus héroes" if d.enemies else "Picks fuertes en este parche")
+             + turn, text_color=GREEN if d.my_turn else TEXT)
+        setw(self.cards["draft"]["extra"], text="datos de GSI" if d.source == "gsi" else "por la barra superior")
+        self.pick_pool.update(d.picks[:6], self._set_pick)
+
+    # ---------- informe de la última partida ----------
+    def _build_report(self, body):
+        self.r_summary = ctk.CTkLabel(body, text="", font=font(13, "bold"), text_color=TEXT, anchor="w",
+                                      wraplength=410, justify="left")
+        self.r_summary.grid(row=0, column=0, sticky="ew")
+        self.r_stats = ctk.CTkLabel(body, text="", font=font(11), text_color=MUTED, anchor="w", wraplength=410,
+                                    justify="left")
+        self.r_stats.grid(row=1, column=0, sticky="ew", pady=(2, 6))
+
+        def factory(i):
+            lbl = ctk.CTkLabel(body, text="", font=font(11), text_color=TEXT, anchor="w", wraplength=410,
+                               justify="left")
+            lbl.grid(row=10 + i, column=0, sticky="ew", pady=1)
+            return {"frame": lbl, "label": lbl}
+        self.note_pool = Pool(factory)
+
+    def _render_report(self):
+        r = self.report
+        if r is None:
+            return
+        res_color = {"win": GREEN, "loss": RED}.get(r.result, TEXT)
+        setw(self.r_summary, text=r.summary(), text_color=res_color)
+        pct = ", ".join(f"{label} {describe(r.percentiles[m])}" for m, label in
+                        (("gold_per_min", "oro/min"), ("xp_per_min", "XP/min"), ("last_hits_per_min", "golpes/min"))
+                        if m in r.percentiles)
+        items = ", ".join(f"{name} {fmt_clock(t)}" for name, t in r.items[-5:])
+        setw(self.r_stats, text=" · ".join(x for x in (
+            f"Últimos golpes al 10': {r.lh_at_10}" if r.lh_at_10 is not None else "", pct, items) if x))
+        notes = [("IA", n) for n in r.ai_notes] + [("", n) for n in r.notes]
+        self.note_pool.update(notes[:6], lambda row, item: setw(
+            row["label"], text=("✦ " if item[0] else "• ") + item[1], text_color=CYAN if item[0] else TEXT))
+        setw(self.cards["report"]["extra"], text="con IA" if r.ai_notes else "")
+
+    # ---------- historial ----------
+    def _build_history(self, body):
+        self.hi_text = ctk.CTkLabel(body, text="", font=font(12), text_color=TEXT, anchor="w", wraplength=410,
+                                    justify="left")
+        self.hi_text.grid(row=0, column=0, sticky="ew")
+
+    def _render_history(self):
+        h = self.history
+        if not h:
+            self._empty("history", "Aquí verás el resumen de tus partidas cuando juegues alguna con el coach.")
+            setw(self.hi_text, text="")
+            return
+        self._empty("history", None)
+        heroes = ", ".join(f"{name} {wins}/{games}" for name, games, wins in h.heroes[:5])
+        lines = [f"{h.games} partidas · {h.wins} victorias, {h.losses} derrotas · {h.avg_deaths:.1f} muertes de media",
+                 f"Héroes (victorias/partidas): {heroes}"]
+        if h.top_death_zone:
+            lines.append(f"Donde más mueres: {h.top_death_zone} · sin enemigos a la vista: {h.fog_death_share:.0%}")
+        lines += [f"Se repite: {r}" for r in h.recurring]
+        setw(self.hi_text, text="\n".join(lines))
+        setw(self.cards["history"]["extra"], text=f"últimas {h.games}")
+
+    # ---------- siguiente compra ----------
+    def _build_next(self, body):
+        body.grid_columnconfigure(1, weight=1)
+        self.n_icon = ctk.CTkLabel(body, text="", width=72, height=53, fg_color=CARD2, corner_radius=4)
+        self.n_name = ctk.CTkLabel(body, text="", font=font(17, "bold"), text_color=TEXT, anchor="w")
+        self.n_cost = ctk.CTkLabel(body, text="", font=font(13), text_color=GOLD, anchor="w")
+        self.n_why = ctk.CTkLabel(body, text="", font=font(11), text_color=MUTED, wraplength=330, justify="left",
+                                  anchor="w")
+        self.n_bar = ctk.CTkProgressBar(body, height=10, fg_color=CARD2)
+        self.n_state = ctk.CTkLabel(body, text="", font=font(12, "bold"), text_color=TEXT, anchor="w")
+        self.n_plan = ctk.CTkFrame(body, fg_color="transparent")
+        self.n_buy = ctk.CTkLabel(body, text="", font=font(13, "bold"), text_color=GREEN, anchor="w",
+                                  wraplength=360, justify="left")
+
+        def step_factory(i):
+            box = ctk.CTkFrame(self.n_plan, fg_color=CARD2, corner_radius=6)
+            box.grid(row=i // 3, column=i % 3, padx=(0, 6), pady=(0, 6), sticky="ew")
+            icon = ctk.CTkLabel(box, text="", width=36, height=27, fg_color=BG, corner_radius=3)
+            icon.grid(row=0, column=0, rowspan=2, padx=6, pady=6)
+            name = ctk.CTkLabel(box, text="", font=font(10, "bold"), text_color=TEXT, anchor="w", wraplength=80,
+                                justify="left")
+            name.grid(row=0, column=1, sticky="w", padx=(0, 6), pady=(4, 0))
+            cost = ctk.CTkLabel(box, text="", font=font(10), text_color=GOLD, anchor="w")
+            cost.grid(row=1, column=1, sticky="w", padx=(0, 6), pady=(0, 4))
+            return {"frame": box, "icon": icon, "name": name, "cost": cost}
+        self.plan_pool = Pool(step_factory)
+        self.n_widgets = [(self.n_icon, dict(row=0, column=0, rowspan=2, padx=(0, 12), sticky="nw")),
+                          (self.n_name, dict(row=0, column=1, sticky="sw")),
+                          (self.n_cost, dict(row=1, column=1, sticky="nw")),
+                          (self.n_why, dict(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))),
+                          (self.n_bar, dict(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 2))),
+                          (self.n_state, dict(row=4, column=0, columnspan=2, sticky="w"))]
+        # el plan y el "compra ahora" se muestran aparte: solo si el objeto tiene componentes
+
+    def _render_next(self):
+        v = self.view
+        card = v.next_item if v else None
+        setw(self.cards["next"]["extra"], text=PHASE_LABELS.get(v.phase, "") if v and v.hero else "")
+        for w, grid in self.n_widgets:
+            show(w, card is not None, **grid)
+        if not card:
+            show(self.n_plan, False)
+            show(self.n_buy, False)
+            self._empty("next", "Cuando elijas héroe verás aquí qué comprar ahora, según la fase de la partida, "
+                                "los enemigos y el parche.")
+            return
+        self._empty("next", None)
+        img = self.images.item(card.short, (72, 53))
+        setw(self.n_icon, image=img, text="" if img else "?")
+        setw(self.n_name, text=card.loc)
+        pay = card.cost if card.to_pay is None else card.to_pay
+        setw(self.n_cost, text=f"{card.cost} de oro" + (f" · te quedan {pay} (ya llevas parte)" if pay < card.cost
+                                                           else ""))
+        why = "; ".join(card.reasons[:2]) + (f"\nParche: {card.patch_note}" if card.patch_note else "")
+        setw(self.n_why, text=why)
+        missing = max(0, pay - v.gold)
+        progress = round(min(1.0, (card.cost - pay + v.gold) / card.cost) if card.cost else 1.0, 2)
+        if _last.setdefault(id(self.n_bar), {}).get("p") != progress:
+            self.n_bar.set(progress)
+            _last[id(self.n_bar)]["p"] = progress
+        setw(self.n_bar, progress_color=GREEN if not missing else GOLD)
+        setw(self.n_state, text="¡Ya puedes comprarlo!" if not missing else f"Te faltan {missing} de oro",
+             text_color=GREEN if not missing else TEXT)
+        self.plan_pool.update(card.plan, self._set_step)
+        show(self.n_plan, bool(card.plan), row=5, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        if card.plan and v.buy_now:
+            what = "la receta" if v.buy_now.name == "recipe" else v.buy_now.loc
+            setw(self.n_buy, text=f"➜ Compra ahora: {what} ({v.buy_now.to_pay})", text_color=GREEN)
+        elif card.plan:
+            nxt = next((s for s in card.plan if not s.owned and s.name != "recipe"), None)
+            setw(self.n_buy, text=f"Siguiente: {nxt.loc} ({nxt.to_pay})" if nxt else "", text_color=MUTED)
+        show(self.n_buy, bool(card.plan), row=6, column=0, columnspan=2, sticky="ew", pady=(2, 0))
+
+    def _set_step(self, row, step):
+        if step.name == "recipe":
+            setw(row["icon"], image=None, text="Rx")
+        else:
+            img = self.images.item(step.short, (36, 27))
+            setw(row["icon"], image=img, text="" if img else "?")
+        setw(row["name"], text=("✓ " if step.owned else "") + step.loc, text_color=GREEN if step.owned else TEXT)
+        if step.owned:
+            setw(row["cost"], text="lo llevas", text_color=GREEN)
+        else:
+            setw(row["cost"], text=str(step.to_pay) + (f" (de {step.cost})" if step.to_pay < step.cost else ""),
+                 text_color=GOLD)
+
+    @staticmethod
+    def _plan_text(card) -> str:
+        if not card.plan:
+            return ""
+        parts = [("✓ " if s.owned else "") + (s.loc if s.owned else f"{s.loc} ({s.to_pay})") for s in card.plan]
+        return "\nOrden: " + " → ".join(parts)
+
+    # ---------- inventario ----------
+    def _build_inventory(self, body):
+        grid = ctk.CTkFrame(body, fg_color="transparent")
+        grid.grid(row=0, column=0, sticky="w")
+        self.inv_slots = {}
+        layout = [(f"slot{i}", 0, i, (56, 41)) for i in range(6)] + \
+                 [(f"slot{i}", 1, i - 6, (40, 29)) for i in range(6, 9)] + \
+                 [("neutral0", 1, 4, (40, 29)), ("teleport0", 1, 5, (40, 29))]
+        for slot, r, c, size in layout:
+            lbl = ctk.CTkLabel(grid, text="", width=size[0], height=size[1], fg_color=CARD2, corner_radius=4)
+            lbl.grid(row=r, column=c, padx=(0, 5), pady=(0, 5), sticky="w")
+            self.inv_slots[slot] = (lbl, size, Tooltip(lbl))
+        self.inv_note = ctk.CTkLabel(body, text="", font=font(10), text_color=MUTED, anchor="w")
+        self.inv_note.grid(row=1, column=0, sticky="w")
+
+    def _render_inventory(self):
+        v = self.view
+        slots = dict(v.inventory) if v else {}
+        for slot, (lbl, size, tip) in self.inv_slots.items():
+            name = slots.get(slot)
+            img = self.images.item(name.removeprefix("item_"), size) if name else None
+            main = slot.startswith("slot") and int(slot[4:]) < 6
+            setw(lbl, image=img, text="" if img or not name else "?", fg_color=CARD2 if main else BG)
+            tip.text = self._loc(name) if name else ""
+        stash = v.stash if v else []
+        if stash:
+            setw(self.inv_note, text="En el alijo: " + ", ".join(self._loc(s) for s in stash))
+        show(self.inv_note, bool(stash), row=1, column=0, sticky="w")
+
+    def _loc(self, name: str) -> str:
+        return (self.item_names or {}).get(name) or name.removeprefix("item_").replace("_", " ").title()
+
+    # ---------- líneas ----------
+    def _hero_icon(self, parent, size=(52, 29)):
+        lbl = ctk.CTkLabel(parent, text="", width=size[0], height=size[1], fg_color=CARD2, corner_radius=3)
+        return lbl, Tooltip(lbl)
+
+    def _build_lanes(self, body):
+        """Con posiciones: top/mid/bot con aliados contra enemigos. Antes (primeros minutos): los detectados."""
+        self.lane_rows = {}
+        for i, lane in enumerate(("top", "mid", "bot")):
+            label = ctk.CTkLabel(body, text=lane.capitalize(), font=font(12, "bold"), text_color=MUTED, width=64,
+                                 anchor="w", height=31)
+            allies = ctk.CTkFrame(body, fg_color="transparent")
+            vs = ctk.CTkLabel(body, text="vs", font=font(10), text_color=MUTED, height=31)
+            enemies = ctk.CTkFrame(body, fg_color="transparent")
+            icons = []
+            for side, frame in (("a", allies), ("e", enemies)):
+                for j in range(3):
+                    lbl, tip = self._hero_icon(frame)
+                    icons.append((side, j, lbl, tip))
+            self.lane_rows[lane] = (i, label, allies, vs, enemies, icons)
+        self.detected = {}
+        for i, (side, title) in enumerate((("a", "Aliados"), ("e", "Enemigos"))):
+            label = ctk.CTkLabel(body, text=title, font=font(12, "bold"), text_color=MUTED, width=64, anchor="w",
+                                 height=31)
+            strip = ctk.CTkFrame(body, fg_color="transparent")
+            icons = [self._hero_icon(strip) for _ in range(5)]
+            self.detected[side] = (i, label, strip, icons)
+        body.grid_columnconfigure(1, weight=1)
+        body.grid_columnconfigure(3, weight=1)
+
+    @staticmethod
+    def _set_icons(icons, heroes, images, color):
+        for j, (lbl, tip) in enumerate(icons):
+            if j >= len(heroes):
+                pack_show(lbl, False)
+                continue
+            pack_show(lbl, True, side="left", padx=2)
+            h = heroes[j]
+            img = images.hero(h, (52, 29))
+            setw(lbl, image=img, text="" if img else h.loc[:2], fg_color=color)
+            tip.text = h.loc
+
+    def _render_lanes(self):
+        v = self.view
+        lanes = v.lanes if v else {}
+        has_lanes = any(info.allies or info.enemies for info in lanes.values())
+        allies = (v.allies + ([v.hero] if v.hero else [])) if v else []
+        enemies = [e.hero for e in v.enemies] if v else []
+        for lane, (i, label, a_frame, vs, e_frame, icons) in self.lane_rows.items():
+            for w, col, kw in ((label, 0, dict(sticky="w")), (a_frame, 1, dict(sticky="e")),
+                               (vs, 2, dict(padx=6)), (e_frame, 3, dict(sticky="w"))):
+                show(w, has_lanes, row=i, column=col, pady=2, **kw)
+            if not has_lanes:
+                continue
+            info = lanes.get(lane)
+            mine = v.my_lane == lane
+            setw(label, text=lane.capitalize() + (" · tú" if mine else ""), text_color=ACCENT if mine else MUTED)
+            for side in ("a", "e"):
+                heroes = (info.allies if side == "a" else info.enemies) if info else []
+                self._set_icons([(lbl, tip) for s_, _, lbl, tip in icons if s_ == side], heroes, self.images,
+                                GREEN if side == "a" else RED)
+        show_detected = not has_lanes and bool(allies or enemies)
+        for side, (i, label, strip, icons) in self.detected.items():
+            show(label, show_detected, row=10 + i, column=0, sticky="w", pady=2)
+            show(strip, show_detected, row=10 + i, column=1, columnspan=3, sticky="w", pady=2)
+            if show_detected:
+                self._set_icons(icons, allies if side == "a" else enemies, self.images,
+                                GREEN if side == "a" else RED)
+        setw(self.cards["lanes"]["extra"], text="" if has_lanes else "se reparten en los primeros minutos")
+        self._empty("lanes", None if (has_lanes or show_detected) else
+                    "Se calculan solas en los primeros minutos con las posiciones del mapa.")
+
+    # ---------- build por fases ----------
+    def _build_phases(self, body):
+        self.ph_rows = {}
+        self.ph_strips = {}
+        for i, phase in enumerate(PHASES):
+            title = ctk.CTkLabel(body, text=PHASE_LABELS[phase], font=font(12, "bold"), text_color=MUTED,
+                                 anchor="w")
+            title.configure(width=96)
+            title.grid(row=i, column=0, sticky="w", pady=3)
+            strip = ctk.CTkFrame(body, fg_color="transparent")
+            strip.grid(row=i, column=1, sticky="w", pady=3)
+            self.ph_strips[phase] = strip
+            slots = []
+            for j in range(6):
+                icon = ctk.CTkLabel(strip, text="", width=46, height=34, fg_color=CARD2, corner_radius=4)
+                icon.grid(row=0, column=j, padx=(0, 4))
+                slots.append({"frame": icon, "icon": icon, "tip": Tooltip(icon), "col": j})
+            self.ph_rows[phase] = (title, slots)
+
+    def _render_phases(self):
+        v = self.view
+        builds = v.phase_builds if v else {}
+        self._empty("phases", None if builds else "Sin héroe todavía.")
+        now = PHASES.index(v.phase) if v and v.phase in PHASES else 0
+        for i, (phase, (title, slots)) in enumerate(self.ph_rows.items()):
+            past = i < now  # las fases que ya pasaron no se enseñan
+            show(title, not past)
+            show(self.ph_strips[phase], not past)
+            current = v is not None and phase == v.phase
+            setw(title, text=("▶ " if current else "") + PHASE_LABELS[phase],
+                 text_color=ACCENT if current else MUTED)
+            cards = builds.get(phase, [])
+            for slot, card in zip(slots, cards + [None] * (len(slots) - len(cards))):
+                if card is None:
+                    show(slot["frame"], False)
+                    continue
+                show(slot["frame"], True, row=0, column=slot["col"], padx=(0, 4))
+                img = self.images.item(card.short, (46, 34))
+                setw(slot["icon"], image=img, text="" if img else "?")
+                slot["tip"].text = f"{card.loc} · {card.cost} de oro\n" + "\n".join(card.reasons[:3]) + \
+                    (f"\nParche: {card.patch_note}" if card.patch_note else "") + self._plan_text(card)
+
+    # ---------- enemigos ----------
+    def _build_enemies(self, body):
+        body.grid_columnconfigure(1, weight=1)
+
+        def factory(i):
+            f = ctk.CTkFrame(body, fg_color=CARD2, corner_radius=6)
+            f.grid(row=i, column=0, columnspan=2, sticky="ew", pady=(0, 4))
+            f.grid_columnconfigure(1, weight=1)
+            portrait = ctk.CTkLabel(f, text="", width=64, height=36, fg_color=BG, corner_radius=4)
+            portrait.grid(row=0, column=0, rowspan=2, padx=6, pady=5, sticky="w")
+            title = ctk.CTkFrame(f, fg_color="transparent")
+            title.grid(row=0, column=1, sticky="ew", pady=(3, 0))
+            name = ctk.CTkLabel(title, text="", font=font(13, "bold"), text_color=TEXT, height=18)
+            name.pack(side="left")
+            wr = ctk.CTkLabel(title, text="", font=font(10), text_color=MUTED, height=18)
+            wr.pack(side="left", padx=(6, 0))
+            verdict = ctk.CTkLabel(title, text="", font=font(10, "bold"), text_color=MUTED, height=18)
+            verdict.pack(side="left", padx=(6, 0))
+            traits = ctk.CTkLabel(f, text="", font=font(10), text_color=MUTED, anchor="w", height=16)
+            traits.grid(row=1, column=1, sticky="ew", pady=(0, 3))
+            strip = ctk.CTkFrame(f, fg_color="transparent")
+            strip.grid(row=0, column=2, rowspan=2, padx=(4, 6))
+            counters = []
+            for j in range(3):
+                icon = ctk.CTkLabel(strip, text="", width=40, height=30, fg_color=BG, corner_radius=3)
+                icon.grid(row=0, column=j, padx=(0, 3))
+                counters.append({"frame": icon, "icon": icon, "tip": Tooltip(icon), "col": j})
+            tips = Tooltip(traits)
+            return {"frame": f, "portrait": portrait, "name": name, "wr": wr, "verdict": verdict, "traits": traits,
+                    "traits_tip": tips, "counters": counters}
+        self.enemy_pool = Pool(factory)
+
+    def _set_enemy(self, row, e: HeroCard):
+        img = self.images.hero(e.hero, (80, 45))
+        setw(row["portrait"], image=img, text="" if img else e.hero.loc[:2])
+        setw(row["name"], text=e.hero.loc)
+        if e.winrate is None:
+            setw(row["wr"], text="")
+        else:
+            setw(row["wr"], text=f"{e.winrate:.1%} WR",
+                 text_color=GREEN if e.winrate >= 0.52 else RED if e.winrate <= 0.48 else MUTED)
+        setw(row["verdict"], text=e.verdict.upper(), text_color=VERDICT_COLORS.get(e.verdict, YELLOW))
+        traits = ", ".join(e.traits) or "–"
+        setw(row["traits"], text=traits if len(traits) <= 46 else traits[:44] + "…")
+        row["traits_tip"].text = traits
+        for slot, card in zip(row["counters"], e.counters + [None] * (3 - len(e.counters))):
+            if card is None:
+                show(slot["frame"], False)
+                continue
+            show(slot["frame"], True, row=0, column=slot["col"], padx=(0, 3))
+            icon = self.images.item(card.short, (40, 30))
+            setw(slot["icon"], image=icon, text="" if icon else "?")
+            slot["tip"].text = f"Contra {e.hero.loc}: {card.loc} · {card.cost} de oro\n" + \
+                (card.reasons[0] if card.reasons else "")
+
+    def _render_enemies(self):
+        enemies = self.view.enemies if self.view else []
+        setw(self.cards["enemies"]["extra"], text=f"{len(enemies)}/5 detectados")
+        self._empty("enemies", None if enemies else "Se detectan solos en la barra superior y el minimapa. También "
+                                                    "puedes indicarlos en los ajustes antes de iniciar el coach.")
+        self.enemy_pool.update(enemies, self._set_enemy)
+
+    # ---------- mapa ----------
+    MAP_SIZE = 330
+
+    def _build_map(self, body):
+        self.map_label = ctk.CTkLabel(body, text="", width=self.MAP_SIZE, height=self.MAP_SIZE, fg_color=CARD2,
+                                      corner_radius=6)
+        self.map_label.grid(row=0, column=0)
+
+    def _render_map(self):
+        frame = self.minimap_frame
+        if frame is None:
+            self._empty("map", "El minimapa aparecerá aquí durante la partida (se lee de la pantalla: juega en "
+                               "ventana sin bordes o pantalla completa en ventana).")
+            show(self.map_label, False)
+            return
+        if frame is self._minimap_shown:
+            return
+        self._minimap_shown = frame
+        self._empty("map", None)
+        show(self.map_label, True, row=0, column=0)
+        img = ctk.CTkImage(light_image=frame, dark_image=frame, size=(self.MAP_SIZE, self.MAP_SIZE))
+        self.map_label.configure(image=img)
+        self._map_image = img  # que no se libere mientras se muestra
+
+    # ---------- consejos ----------
+    def _build_tips(self, body):
+        def factory(i):
+            f = ctk.CTkFrame(body, fg_color="transparent")
+            f.grid(row=i, column=0, sticky="ew", pady=(0, 4))
+            f.grid_columnconfigure(1, weight=1)
+            meta = ctk.CTkLabel(f, text="", font=font(10, "bold"), anchor="nw", width=78, height=16)
+            meta.grid(row=0, column=0, sticky="nw", pady=(1, 0))
+            text = ctk.CTkLabel(f, text="", font=font(12), text_color=TEXT, wraplength=330, justify="left",
+                                anchor="w")
+            text.grid(row=0, column=1, sticky="ew")
+            return {"frame": f, "meta": meta, "text": text}
+        self.tip_pool = Pool(factory)
+
+    def _set_tip(self, row, item):
+        i, t = item
+        label = f"{fmt_clock(t.clock)} {KIND_LABELS.get(t.kind, t.kind.upper())}" + (" ·IA" if t.source == "ai" else "")
+        setw(row["meta"], text=label, text_color=KIND_COLORS.get(t.kind, MUTED))
+        setw(row["text"], text=t.text, font=font(13 if i == 0 else 12), text_color=TEXT if i == 0 else MUTED)
+
+    def _render_tips(self):
+        if self._tips_shown == len(self.tips):
+            return
+        self._tips_shown = len(self.tips)
+        setw(self.cards["tips"]["extra"], text=str(len(self.tips)) if self.tips else "")
+        self._empty("tips", None if self.tips else "Los consejos y avisos del mapa aparecerán aquí.")
+        self.tip_pool.update(list(enumerate(reversed(self.tips[-TIP_ROWS:]))), self._set_tip)
+
+    # ---------- partidas parecidas ----------
+    def _build_similar(self, body):
+        self.s_summary = ctk.CTkLabel(body, text="", font=font(11), text_color=TEXT, wraplength=410,
+                                      justify="left", anchor="w")
+        self.s_strip = ctk.CTkFrame(body, fg_color="transparent")
+        self.s_slots = []
+        for j in range(6):
+            box = ctk.CTkFrame(self.s_strip, fg_color="transparent")
+            icon = ctk.CTkLabel(box, text="", width=44, height=32, fg_color=CARD2, corner_radius=4)
+            icon.pack()
+            count = ctk.CTkLabel(box, text="", font=font(10, "bold"), text_color=GREEN, height=14)
+            count.pack()
+            self.s_slots.append({"frame": box, "icon": icon, "count": count, "tip": Tooltip(icon), "col": j})
+
+        def factory(i):
+            f = ctk.CTkFrame(body, fg_color="transparent")
+            f.grid(row=10 + i, column=0, sticky="ew", pady=1)
+            res = ctk.CTkLabel(f, text="", font=font(11, "bold"), width=70, anchor="w")
+            res.pack(side="left")
+            icons = []
+            for _ in range(6):
+                lbl = ctk.CTkLabel(f, text="", width=30, height=22, fg_color=CARD2, corner_radius=3)
+                icons.append({"icon": lbl, "tip": Tooltip(lbl)})
+            return {"frame": f, "res": res, "icons": icons}
+        self.match_pool = Pool(factory)
+
+    def _set_match(self, row, m):
+        setw(row["res"], text=f"{'GANA' if m.win else 'pierde'} {m.duration // 60}'",
+             text_color=GREEN if m.win else RED)
+        for slot, name in zip(row["icons"], m.items[:6] + [None] * (6 - len(m.items[:6]))):
+            if name is None:
+                pack_show(slot["icon"], False)
+                continue
+            pack_show(slot["icon"], True, side="left", padx=(0, 3))
+            img = self.images.item(name.removeprefix("item_"), (30, 22))
+            setw(slot["icon"], image=img, text="" if img else "?")
+            slot["tip"].text = self._item_name(name)
+
+    def _item_name(self, name: str) -> str:
+        names = self.similar.names if self.similar else {}
+        return names.get(name) or name.removeprefix("item_").replace("_", " ").title()
+
+    def _render_similar(self):
+        r = self.similar
+        has = r is not None
+        show(self.s_summary, has, row=0, column=0, sticky="ew")
+        show(self.s_strip, has, row=1, column=0, sticky="w", pady=(4, 4))
+        if not has:
+            setw(self.cards["similar"]["extra"], text="")
+            msg = {"buscando": "Buscando partidas parecidas en OpenDota…",
+                   "sin datos": "No hay partidas recientes con esta combinación de héroes."}.get(
+                self.similar_state, "Cuando haya héroe y enemigos detectados, se buscan partidas recientes con esa "
+                                    "combinación y qué compraron los que ganaron.")
+            self._empty("similar", msg)
+            self.match_pool.update([], self._set_match)
+            return
+        self._empty("similar", None)
+        setw(self.cards["similar"]["extra"], text=f"{r.wins}/{len(r.matches)} ganadas")
+        vs = ", ".join(h.loc for h in r.vs)
+        setw(self.s_summary, text=f"Contra {vs}: lo que llevaban al final los que ganaron")
+        for slot, item in zip(self.s_slots, r.top_items + [None] * (6 - len(r.top_items))):
+            if item is None:
+                show(slot["frame"], False)
+                continue
+            name, n = item
+            show(slot["frame"], True, row=0, column=slot["col"], padx=(0, 4))
+            img = self.images.item(name.removeprefix("item_"), (44, 32))
+            setw(slot["icon"], image=img, text="" if img else "?")
+            setw(slot["count"], text=f"{n}/{r.wins}")
+            slot["tip"].text = f"{self._item_name(name)}: en {n} de {r.wins} victorias"
+        self.match_pool.update(r.matches[:3], self._set_match)
+
+    # ---------- parche ----------
+    def _build_patch(self, body):
+        body.grid_columnconfigure(1, weight=1)
+
+        def factory(i):
+            f = ctk.CTkFrame(body, fg_color="transparent")
+            f.grid(row=i, column=0, columnspan=2, sticky="ew", pady=0)
+            f.grid_columnconfigure(1, weight=1)
+            tag = ctk.CTkLabel(f, text="", font=font(10, "bold"), width=58, anchor="w", height=18)
+            tag.grid(row=0, column=0, sticky="nw")
+            text = ctk.CTkLabel(f, text="", font=font(11), text_color=TEXT, anchor="w", height=18)
+            text.grid(row=0, column=1, sticky="ew")
+            return {"frame": f, "tag": tag, "text": text, "tip": Tooltip(text)}
+        self.patch_pool = Pool(factory)
+
+    def _set_change(self, row, ch):
+        setw(row["tag"], text=ch.tag, text_color=GREEN if ch.direction > 0 else RED if ch.direction < 0 else MUTED)
+        full = f"{ch.detail}: {ch.text}"
+        setw(row["text"], text=full if len(full) <= 52 else full[:50] + "…")
+        row["tip"].text = full
+
+    def _render_patch(self):
+        v = self.view
+        changes = v.my_changes if v else []
+        hero = v.hero if v else None
+        setw(self.cards["patch"]["extra"], text=f"{len(changes)} cambios" if changes else "")
+        self._empty("patch", None if changes else
+                    ("El parche actual no cambia a tu héroe." if hero else "Elige héroe para verlo."))
+        self.patch_pool.update(changes[:5], self._set_change)
+
+    # ---------- bucle ----------
+    def _render(self):
+        for part in (self._render_mode, self._render_draft, self._render_report, self._render_history,
+                     self._render_header, self._render_map, self._render_inventory, self._render_next,
+                     self._render_lanes, self._render_phases,
+                     self._render_enemies, self._render_tips, self._render_similar, self._render_battle,
+                     self._render_patch, self._render_theme):
+            try:
+                part()
+            except Exception:
+                log.exception("error pintando el panel (%s)", part.__name__)
+
+    def _poll(self):
+        try:
+            while True:
+                kind, payload = self.q.get_nowait()
+                if kind == "view":
+                    self.view = payload
+                    self.last_state = self.view_time = time.time()
+                elif kind == "tips":
+                    self.tips = (self.tips + list(payload))[-MAX_TIPS:]
+                elif kind == "similar":
+                    self.similar, self.similar_state = payload, "" if payload else "sin datos"
+                elif kind == "similar_searching":
+                    self.similar, self.similar_state = None, "buscando"
+                elif kind == "toast":
+                    self.toast.show(payload.get("title", ""), payload.get("text", ""), payload.get("level", "info"),
+                                    TOAST_ICONS.get(payload.get("icon", ""), "●"))
+                elif kind == "draft":
+                    self.draft = payload
+                elif kind == "report":
+                    self.report = payload
+                elif kind == "history":
+                    self.history = payload
+                elif kind == "minimap":
+                    self.minimap_frame = payload
+                elif kind == "reset":
+                    self.tips, self.view, self.similar, self.similar_state = [], None, None, ""
+                    self.draft = None
+                    self._tips_shown = -1
+        except queue.Empty:
+            pass
+        if self.images.changed.is_set():  # llegaron retratos/iconos nuevos: los siguientes setw los pondrán
+            self.images.changed.clear()
+            self._tips_shown = -1
+        self._render()
+        self.after(300, self._poll)
+
+    def on_close(self):
+        try:
+            fresh = config.load()  # no pisar lo que se haya cambiado en los ajustes mientras tanto
+            fresh.setdefault("panel", {}).update(geometry=self.geometry(), on_top=bool(self.v_top.get()))
+            config.save(fresh)
+        except OSError:
+            pass
+        self.destroy()

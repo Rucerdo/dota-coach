@@ -30,10 +30,22 @@ DEFAULTS = {
         "periodic_minutes": 8,
         "max_tips": 2,
     },
+    "toasts": True,             # notificaciones flotantes (ganks, TPs, torres, rachas)
+    "toasts_position": "game",  # game: encima de Dota, centradas bajo los retratos | panel: sobre el panel
+    "timer_alerts": True,       # avisos de runas (recompensa, poder, sabiduría, loto) según tu rol
+    "map_alerts": True,         # avisos del mapa: enemigo desaparecido de tu línea, ganks, TPs (y reparto de líneas)
+    "record_gsi": True,         # guardar muestras de GSI en gsi_record.jsonl (para estudiar el minimapa)
     "vision": True,             # reconocer los héroes de la barra superior (experimental)
     "topbar": {},               # ajustes finos de la barra superior (mismas claves que el traductor)
     "tts": False,               # leer los consejos en voz alta (voz de Windows)
-    "overlay": {
+    "panel": {                  # ventana de partida (estilo Dota Plus)
+        "enabled": True,
+        "on_top": False,
+        "screen": "secondary",  # secondary: maximizado en la pantalla secundaria (o la única) | saved: la última
+        "geometry": "",         # se recuerda al cerrarla (con screen = "saved")
+    },
+    "overlay": {                # consejos encima del juego: desactivado, todo va al panel de partida
+        "enabled": False,
         "x_frac": 0.70,
         "y_frac": 0.12,
         "width_frac": 0.28,

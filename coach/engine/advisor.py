@@ -20,8 +20,9 @@ from typing import Callable
 from ..ai.base import LLMError, Provider
 from ..ai.prompts import TIPS_SCHEMA, tips_prompt
 from ..data.gamedata import GameData, Hero
-from ..gsi import GameState
-from .counters import TRAIT_LABELS, ItemSuggestion, enemy_traits, item_role, suggest_items
+from ..gsi import GameState, GameTracker
+from .counters import (COUNTER_ITEMS, TRAIT_LABELS, ItemSuggestion, enemy_traits, item_role, phase_for,
+                       suggest_items)
 
 log = logging.getLogger(__name__)
 
@@ -37,8 +38,10 @@ class Tip:
 class Advisor:
     def __init__(self, gd: GameData, meta, cfg: dict, provider: Provider | None = None,
                  on_tips: Callable[[list[Tip]], None] = lambda tips: None,
-                 popularity: Callable[[int], dict] | None = None, sync: bool = False):
+                 popularity: Callable[[int], dict] | None = None, sync: bool = False,
+                 extra_context: Callable[[GameState], list[str]] | None = None):
         self.gd, self.meta, self.cfg, self.provider = gd, meta, cfg, provider
+        self.extra_context = extra_context  # líneas extra para la IA: mapa, líneas, plan de compra, percentiles
         self.on_tips, self.popularity, self.sync = on_tips, popularity, sync
         adv = cfg.get("advisor", {})
         self.min_ai_gap = float(adv.get("min_seconds_between_ai", 45))
@@ -48,6 +51,7 @@ class Advisor:
         self._lock = threading.Lock()
         self._busy = False
         self._pop_cache: dict[int, dict] = {}
+        self.games = GameTracker()
         self.reset("")
 
     # ---------- estado ----------
@@ -55,6 +59,7 @@ class Advisor:
         self.match_id = match_id
         self.enemies: dict[int, Hero] = {}
         self.allies: dict[int, Hero] = {}
+        self.my_hero_id = 0
         self.started = False
         self.deaths = 0
         self.last_periodic = 0
@@ -67,30 +72,31 @@ class Advisor:
         """Enemigos indicados a mano o detectados en la barra superior."""
         with self._lock:
             for h in heroes:
-                self.enemies[h.id] = h
+                if h.id not in self.allies and h.id != self.my_hero_id:
+                    self.enemies[h.id] = h
 
     def set_allies(self, heroes: list[Hero]):
+        """Un aliado confirmado nunca puede ser enemigo (si se coló como tal, se corrige)."""
         with self._lock:
             for h in heroes:
                 self.allies[h.id] = h
+                self.enemies.pop(h.id, None)
+            self._known_enemy_count = min(self._known_enemy_count, len(self.enemies))
 
     # ---------- entrada desde GSI ----------
     def update(self, st: GameState):
-        if st.match_id and st.match_id != self.match_id:
-            if self.match_id:
-                self.reset(st.match_id)  # partida nueva: olvidar la anterior
-            else:
-                self.match_id = st.match_id  # primera partida: conservar los enemigos indicados antes
+        if self.games.update(st):
+            self.reset(st.match_id)  # partida nueva: olvidar la anterior
+        elif st.match_id and not self.match_id:
+            self.match_id = st.match_id  # primera partida: conservar los enemigos indicados antes
+        me = self.my_hero(st)
+        if me:
+            self.my_hero_id = me.id
+            self.enemies.pop(me.id, None)
         if not st.in_game:
             return
-        for name in st.visible_enemies:
-            h = self.gd.hero(name)
-            if h:
-                self.enemies.setdefault(h.id, h)
-        for name in st.visible_allies:
-            h = self.gd.hero(name)
-            if h:
-                self.allies.setdefault(h.id, h)
+        self.set_allies([h for h in map(self.gd.hero, st.visible_allies) if h])
+        self.set_enemies([h for h in map(self.gd.hero, st.visible_enemies) if h])
         triggers = self.triggers(st)
         if triggers:
             self.advise(st, triggers)
@@ -109,11 +115,11 @@ class Advisor:
         if st.deaths > self.deaths:
             self.deaths = st.deaths
             out.append("death")
-        if st.clock - self.last_periodic >= self.periodic:
+        if self.periodic and st.clock - self.last_periodic >= self.periodic:  # 0 = nunca
             self.last_periodic = st.clock
             out.append("periodic")
         nxt = self.next_item(st)
-        if nxt and st.gold >= nxt.cost and nxt.item not in self.announced_items:
+        if nxt and st.gold >= nxt.to_pay and nxt.item not in self.announced_items:
             out.append("gold")
         return out
 
@@ -131,10 +137,14 @@ class Advisor:
                 self._pop_cache[hero.id] = {}
         return self._pop_cache[hero.id]
 
-    def suggestions(self, st: GameState) -> list[ItemSuggestion]:
+    def suggestions(self, st: GameState, phase: str | None = "auto", limit: int = 6) -> list[ItemSuggestion]:
+        """Objetos sugeridos para la fase actual de la partida (o la indicada)."""
         hero = self.my_hero(st)
+        if phase == "auto":
+            phase = phase_for(st.clock)
         return suggest_items(self.gd, hero, list(self.enemies.values()), st.all_items,
-                             self.cfg.get("role", "auto"), self.meta, self._popularity(hero))
+                             self.cfg.get("role", "auto"), self.meta, self._popularity(hero), limit=limit,
+                             phase=phase)
 
     def next_item(self, st: GameState) -> ItemSuggestion | None:
         sugg = self.suggestions(st)
@@ -143,13 +153,13 @@ class Advisor:
     def rule_tips(self, st: GameState, triggers: list[str]) -> list[Tip]:
         sugg = self.suggestions(st)
         tips: list[Tip] = []
-        if "gold" in triggers and sugg and st.gold >= sugg[0].cost:
+        if "gold" in triggers and sugg and st.gold >= sugg[0].to_pay:
             s = sugg[0]
             tips.append(Tip("item", f"Ya puedes comprar {s.loc}: {s.reasons[0]}", "rules", st.clock))
         if "death" in triggers:
             if sugg:
                 s = sugg[0]
-                falta = max(0, s.cost - st.gold)
+                falta = max(0, s.to_pay - st.gold)
                 tips.append(Tip("item", f"Muerto {st.respawn_seconds}s. Siguiente: {s.loc}"
                                          + (f" (te faltan {falta})" if falta else " (ya te llega)"), "rules", st.clock))
             if st.clock > 30 * 60 and st.gold < st.buyback_cost + 500:
@@ -157,11 +167,15 @@ class Advisor:
         if "start" in triggers or "enemy" in triggers or "periodic" in triggers:
             traits = enemy_traits(list(self.enemies.values()))
             if traits:
-                trait, heroes = max(traits.items(), key=lambda kv: len(kv[1]))
-                counter = next((s for s in sugg if any(h in r for r in s.reasons for h in heroes)), None)
-                if counter:
-                    tips.append(Tip("counter", f"Contra {TRAIT_LABELS.get(trait, trait)} ({', '.join(heroes)}): "
-                                               f"{counter.loc}", "rules", st.clock))
+                # el rasgo más repetido que tenga un counter de verdad entre las sugerencias (no basta con que
+                # el objeto mencione a esos héroes por otro motivo: BKB no es un counter de la curación)
+                for trait, heroes in sorted(traits.items(), key=lambda kv: len(kv[1]), reverse=True):
+                    counters = {name for name, _, _ in COUNTER_ITEMS.get(trait, [])}
+                    counter = next((s for s in sugg if s.item in counters), None)
+                    if counter:
+                        tips.append(Tip("counter", f"Contra {TRAIT_LABELS.get(trait, trait)} ({', '.join(heroes)}): "
+                                                   f"{counter.loc}", "rules", st.clock))
+                        break
             elif "start" in triggers and sugg:
                 tips.append(Tip("item", "Plan: " + ", ".join(s.loc for s in sugg[:3]), "rules", st.clock))
         hero = self.my_hero(st)
@@ -200,6 +214,11 @@ class Advisor:
             if ctx:
                 lines.append(f"Current patch {self.meta.patch} — relevant changes and meta:")
                 lines.append(ctx)
+        if self.extra_context:
+            try:
+                lines += self.extra_context(st)
+            except Exception:
+                log.exception("no se pudo añadir el contexto extra")
         if self.recent:
             lines.append("Recent tips (do not repeat): " + " | ".join(self.recent[-4:]))
         return "\n".join(lines)
@@ -250,7 +269,7 @@ class Advisor:
 
     def _emit(self, st: GameState, tips: list[Tip]):
         nxt = self.next_item(st)
-        if nxt and st.gold >= nxt.cost:
+        if nxt and st.gold >= nxt.to_pay:
             self.announced_items.add(nxt.item)  # no repetir el aviso de oro del mismo objeto
         if not tips:
             return

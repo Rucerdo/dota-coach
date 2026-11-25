@@ -52,3 +52,28 @@ def test_install_in_fake_dota_dir(tmp_path):
     assert path.parent.name == "gamestate_integration" and '"minimap"' in path.read_text(encoding="utf-8")
     assert dota.is_installed(d, 53124) and not dota.is_installed(d, 1)
     assert dota.uninstall(d) and not path.exists()
+
+
+def test_gsi_recorder_samples_and_rotates(tmp_path):
+    import json as _json
+    from coach.gsi import GSIRecorder
+    rec = GSIRecorder(tmp_path / "rec.jsonl", every=0.0, max_mb=0.0001)
+    for i in range(5):
+        rec.write({"map": {"clock_time": i}, "pad": "x" * 50})
+    lines = (tmp_path / "rec.jsonl").read_text(encoding="utf-8").splitlines()
+    assert lines and _json.loads(lines[-1])["payload"]["map"]["clock_time"] == 4
+    assert (tmp_path / "rec.old.jsonl").exists()
+    slow = GSIRecorder(tmp_path / "slow.jsonl", every=60)
+    slow.write({"a": 1}); slow.write({"a": 2})
+    assert len((tmp_path / "slow.jsonl").read_text(encoding="utf-8").splitlines()) == 1
+
+
+def test_parse_draft_tolerant():
+    from coach.gsi import parse_draft
+    d = parse_draft({"activeteam": 3, "pick": True, "activeteam_time_remaining": 25,
+                     "team2": {"home_team": True, "pick0_id": 8, "pick0_class": "juggernaut", "pick1_id": 0,
+                               "ban0_id": 44},
+                     "team3": {"pick0_class": "lion", "pick1_id": 0}})
+    assert d["radiant"] == [8, "npc_dota_hero_juggernaut"] and d["dire"] == ["npc_dota_hero_lion"]
+    assert d["radiant_bans"] == [44] and d["active"] == "dire" and d["pick"] and d["time_left"] == 25
+    assert parse_draft(None) == {} and parse_draft({}) == {}

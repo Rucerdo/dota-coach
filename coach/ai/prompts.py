@@ -97,3 +97,20 @@ def draft_prompt(context: str, lang: str) -> tuple[str, str]:
 From the candidate heroes (already scored by matchup data and current meta), recommend the best 3 for the player's role, explaining for each in one or two sentences why it works against the enemy heroes and how the current patch affects it. Then give a short starting-items and first-items plan for your top pick.
 Use only the data given. Keep hero, item and ability names in English. Be concise."""
     return system, context
+
+
+REVIEW_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "notes": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["notes"],
+    "additionalProperties": False,
+}
+
+
+def review_prompt(report: str, lang: str) -> tuple[str, str]:
+    """Resumen después de la partida: los 3 errores o mejoras más importantes."""
+    system = f"""You are a Dota 2 coach reviewing a match the player just finished, writing in {_lang(lang)}.
+Give exactly 3 short, concrete notes (under 30 words each): the most important mistakes or things to improve next game, using only the data given (deaths with time, map zone and visible enemies; item timings; percentiles against other players of the same hero; lane and game info). Mention one thing that went well only if the data clearly shows it. Keep hero and item names in English."""
+    return system, report
