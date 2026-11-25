@@ -19,7 +19,7 @@ def matcher(gd):
         p = topbar.official_dir() / f"{h.short}.png"
         p.parent.mkdir(parents=True, exist_ok=True)
         _img(h.id).save(p)
-    m = HeroMatcher(gd, aspect=256 / 144)
+    m = HeroMatcher(gd)
     m.load(download=False)
     return m
 
@@ -69,3 +69,18 @@ def test_diagnose_saved_screenshot(gd, matcher):
     assert [r["ok"] for r in rows] == [True, False, True, True, True, None, None, None, None, True]
     assert not rows[6]["valid"]
     assert rows[1]["hero"].loc == "Crystal Maiden"
+
+
+def test_dead_hero_gray_portrait(gd, matcher):
+    """El HUD pinta en gris a los muertos: se compara en escala de grises."""
+    gray = _img(44, (66, 35)).convert("L").convert("RGB")
+    assert topbar.is_gray(gray) and not topbar.is_gray(_img(44, (66, 35)))
+    assert matcher.match(gray)[0].loc == "Phantom Assassin"
+
+
+def test_gray_template_only_for_gray(gd, matcher):
+    """Una plantilla aprendida de un muerto (gris) no debe reconocer retratos en color."""
+    dead = _img(777, (66, 35)).convert("L").convert("RGB")
+    matcher.learn(gd.hero("Lion"), dead)
+    assert matcher.match(dead)[0].loc == "Lion"
+    assert matcher.match(_img(777, (66, 35)))[0] is None

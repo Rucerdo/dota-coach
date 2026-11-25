@@ -35,17 +35,26 @@ from ..data.gamedata import CDN, GameData, Hero
 log = logging.getLogger(__name__)
 user32 = ctypes.windll.user32
 
+# Retrato completo de cada hueco a 1080 px de alto (calibrado buscando la máxima correlación en capturas
+# reales a 1920x1080, HUD de 2026): ~66x35 px, la imagen oficial entera. Es más ancho que la separación
+# entre huecos porque los bordes inclinados tapan parte de cada retrato.
 DEFAULT_TOPBAR = {
-    "radiant_first_center": -386,
-    "dire_first_center": 137,
-    "pitch": 62,
-    "half_width": 28,
-    "top": 5,
+    "radiant_first_center": -383,
+    "dire_first_center": 135,
+    "pitch": 62.1,
+    "half_width": 33,
+    "top": 4,
     "bottom": 39,
 }
-SIZE = (32, 20)
-MIN_SCORE = 0.55
-MIN_MARGIN = 0.04
+# Parte del retrato que se compara, en fracciones (izq, arriba, der, abajo): la franja de arriba, con la cara.
+# Abajo el HUD pinta encima la insignia de rango (en una esquina) y el rombo verde (en el centro), y los
+# bordes laterales van inclinados y muestran el retrato vecino. Se aplica igual al recorte y a la plantilla.
+COMPARE_REGION = (0.08, 0.03, 0.92, 0.58)
+SIZE = (32, 14)
+GRAY_SATURATION = 40  # por debajo, el retrato está en gris (héroe muerto): se compara en escala de grises
+# Capturas reales (1080p): aciertos 0.79-0.96 con margen >= 0.35; dudosos con margen 0.01-0.03.
+MIN_SCORE = 0.60
+MIN_MARGIN = 0.10
 
 
 # ---------- captura ----------
@@ -105,19 +114,32 @@ def capture_tiles(cfg: dict | None = None) -> dict[int, Image.Image]:
 
 
 # ---------- comparación ----------
-def _vector(img: Image.Image, aspect: float) -> np.ndarray:
-    img = img.convert("RGB")
+def _region(img: Image.Image, region: tuple[float, float, float, float]) -> Image.Image:
     w, h = img.size
-    if w / h > aspect:  # recortar al mismo formato que el recorte del HUD
-        nw = int(h * aspect)
-        img = img.crop(((w - nw) // 2, 0, (w - nw) // 2 + nw, h))
-    else:
-        nh = int(w / aspect)
-        img = img.crop((0, (h - nh) // 2, w, (h - nh) // 2 + nh))
-    a = np.asarray(img.resize(SIZE, Image.BILINEAR), dtype=np.float32).reshape(-1, 3)
+    l, t, r, b = region
+    return img.convert("RGB").crop((round(l * w), round(t * h), round(r * w), round(b * h)))
+
+
+def _normalize(a: np.ndarray) -> np.ndarray:
     a = (a - a.mean(axis=0)) / (a.std(axis=0) + 1e-6)
     v = a.reshape(-1)
     return v / (np.linalg.norm(v) + 1e-6)
+
+
+def _vector(img: Image.Image, region=COMPARE_REGION) -> np.ndarray:
+    """Retrato completo (plantilla o recorte del HUD) → vector de color normalizado por canal (NCC)."""
+    small = _region(img, region).resize(SIZE, Image.BILINEAR)
+    return _normalize(np.asarray(small, dtype=np.float32).reshape(-1, 3))
+
+
+def _gray_vector(img: Image.Image, region=COMPARE_REGION) -> np.ndarray:
+    small = _region(img, region).convert("L").resize(SIZE, Image.BILINEAR)
+    return _normalize(np.asarray(small, dtype=np.float32).reshape(-1, 1))
+
+
+def is_gray(img: Image.Image) -> bool:
+    """Retrato desaturado: el HUD pinta así a los héroes muertos."""
+    return ImageStat.Stat(_region(img, COMPARE_REGION).convert("HSV")).mean[1] < GRAY_SATURATION
 
 
 def official_dir() -> Path:
@@ -135,15 +157,22 @@ def unknown_dir() -> Path:
 class HeroMatcher:
     """Varias plantillas por héroe (oficial + aprendidas). 'ids[i]' es el héroe de la fila i de la matriz."""
 
-    def __init__(self, gd: GameData, aspect: float = 56 / 34):
-        self.gd, self.aspect = gd, aspect
+    def __init__(self, gd: GameData, region: tuple[float, float, float, float] = COMPARE_REGION):
+        self.gd, self.region = gd, region
         self.ids: list[int] = []
         self.matrix: np.ndarray | None = None
+        self.gray: np.ndarray | None = None  # las mismas plantillas en escala de grises
         self._lock = threading.Lock()
+
+    def _vectors(self, img: Image.Image) -> tuple[np.ndarray, np.ndarray]:
+        """(color, gris). Una plantilla en gris (recorte de un muerto) solo vale para comparar con grises:
+        su vector de color se anula para que no puntúe contra retratos en color."""
+        vec, gvec = _vector(img, self.region), _gray_vector(img, self.region)
+        return (np.zeros_like(vec) if is_gray(img) else vec), gvec
 
     def load(self, download: bool = True) -> int:
         """Retratos oficiales (se descargan una vez) + plantillas aprendidas."""
-        vecs, ids = [], []
+        vecs, grays, ids = [], [], []
         for h in self.gd.heroes.values():
             path = official_dir() / f"{h.short}.png"
             if download and h.img:
@@ -153,13 +182,16 @@ class HeroMatcher:
                 if not p.exists():
                     continue
                 try:
-                    vecs.append(_vector(Image.open(p), self.aspect))
+                    vec, gvec = self._vectors(Image.open(p))
+                    vecs.append(vec)
+                    grays.append(gvec)
                     ids.append(h.id)
                 except OSError:
                     continue
         with self._lock:
             self.ids = ids
             self.matrix = np.stack(vecs) if vecs else None
+            self.gray = np.stack(grays) if grays else None
         log.info("plantillas de retratos: %d (%d héroes)", len(ids), len(set(ids)))
         return len(ids)
 
@@ -167,11 +199,13 @@ class HeroMatcher:
         """Guarda un recorte real del HUD como plantilla del héroe (p. ej. con su arcana)."""
         if not looks_valid(tile):
             return None
-        vec = _vector(tile, self.aspect)
+        vec, gvec = self._vectors(tile)
+        gray = is_gray(tile)
         with self._lock:
-            if self.matrix is not None:
+            known = self.gray if gray else self.matrix
+            if known is not None:
                 rows = [i for i, hid in enumerate(self.ids) if hid == hero.id]
-                if rows and float(np.max(self.matrix[rows] @ vec)) > 0.92:
+                if rows and float(np.max(known[rows] @ (gvec if gray else vec))) > 0.92:
                     return None  # ya hay una plantilla casi idéntica
             folder = learned_dir() / hero.short
             folder.mkdir(parents=True, exist_ok=True)
@@ -179,16 +213,18 @@ class HeroMatcher:
             tile.convert("RGB").save(path)
             self.ids.append(hero.id)
             self.matrix = vec[None, :] if self.matrix is None else np.vstack([self.matrix, vec])
+            self.gray = gvec[None, :] if self.gray is None else np.vstack([self.gray, gvec])
         log.info("plantilla aprendida para %s: %s", hero.loc, path.name)
         return path
 
     def ranked(self, tile: Image.Image) -> list[tuple[int, float]]:
         """[(hero_id, mejor puntuación de sus plantillas)] de mayor a menor; vacío si el recorte no vale."""
+        gray = is_gray(tile)
         with self._lock:
-            matrix, ids = self.matrix, list(self.ids)
+            matrix, ids = (self.gray if gray else self.matrix), list(self.ids)
         if matrix is None or not looks_valid(tile):
             return []
-        scores = matrix @ _vector(tile, self.aspect)
+        scores = matrix @ (_gray_vector if gray else _vector)(tile, self.region)
         best_per_hero: dict[int, float] = {}
         for hid, s in zip(ids, scores):
             if s > best_per_hero.get(hid, -2.0):
