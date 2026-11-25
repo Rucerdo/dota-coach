@@ -132,9 +132,11 @@ class Meta:
         nerfed = sorted((h for h in changed if h.patch_score < 0), key=lambda h: h.patch_score)
         return buffed[:n], nerfed[:n]
 
-    def items_summary(self) -> list[tuple[str, float, int]]:
-        return sorted(((name, score(cs), len(cs)) for name, cs in self.items.items()),
-                      key=lambda t: t[1], reverse=True)
+    def items_summary(self, kind: str = "item") -> list[tuple[str, float, int]]:
+        """(objeto, saldo del parche, nº de cambios). kind: "item" (tienda) o "neutral_item" (neutrales y
+        encantamientos), para que los encantamientos no se mezclen con los objetos que se compran."""
+        rows = ((name, score(cs), len(cs)) for name, cs in self.items.items() if cs and cs[0].kind == kind)
+        return sorted(rows, key=lambda t: t[1], reverse=True)
 
     def brief(self, n: int = 8) -> str:
         """Resumen del meta sin IA."""
@@ -150,11 +152,14 @@ class Meta:
         lines.append("")
         lines.append("Más buffeados en las notas: " + ", ".join(f"{h.hero.loc} ({h.patch_score:+.1f})" for h in buffed))
         lines.append("Más nerfeados en las notas: " + ", ".join(f"{h.hero.loc} ({h.patch_score:+.1f})" for h in nerfed))
-        items = self.items_summary()
-        if items:
-            lines.append("")
-            lines.append("Objetos mejorados: " + ", ".join(f"{n} ({s:+.1f})" for n, s, _ in items[:n] if s > 0))
-            lines.append("Objetos empeorados: " + ", ".join(f"{n} ({s:+.1f})" for n, s, _ in items[::-1][:n] if s < 0))
+        for kind, label in (("item", "Objetos"), ("neutral_item", "Neutrales")):
+            items = self.items_summary(kind)
+            up = ", ".join(f"{name} ({s:+.1f})" for name, s, _ in items[:n] if s > 0)
+            down = ", ".join(f"{name} ({s:+.1f})" for name, s, _ in items[::-1][:n] if s < 0)
+            if up or down:
+                lines.append("")
+                lines.append(f"{label} mejorados: {up or '—'}")
+                lines.append(f"{label} empeorados: {down or '—'}")
         return "\n".join(lines)
 
     def context_for(self, heroes: list[Hero], items: list[str] = ()) -> str:

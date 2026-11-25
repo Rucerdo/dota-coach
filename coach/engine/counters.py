@@ -80,6 +80,9 @@ HARD_CARRIES = {
 # Peso de lo que se compra con tu héroe (OpenDota) frente a los counters
 POPULARITY_WEIGHT = 12
 
+# Objetos que resuelven lo mismo: de cada grupo solo se sugiere el de más prioridad
+ALTERNATIVES = [{"item_dust", "item_gem"}, {"item_orchid", "item_bloodthorn"}]
+
 # Lo básico de cualquier partida, con prioridad baja
 UTILITY = [("item_magic_wand", "any", "barato y salva vidas contra hechizos"), ("item_ward_observer", "support", "visión")]
 
@@ -172,4 +175,12 @@ def suggest_items(gd: GameData, my_hero: Hero | None, enemies: list[Hero], owned
                 review = meta.item_reviews.get(s.loc.lower()) if hasattr(meta, "item_reviews") else None
                 s.patch_note = (review or {}).get("summary") or "; ".join(c.text for c in changes[:2])
 
-    return sorted(sugg.values(), key=lambda s: s.priority, reverse=True)[:limit]
+    out, used_groups = [], set()
+    for s in sorted(sugg.values(), key=lambda s: s.priority, reverse=True):
+        group = next((i for i, g in enumerate(ALTERNATIVES) if s.item in g), None)
+        if group is not None:
+            if group in used_groups:
+                continue
+            used_groups.add(group)
+        out.append(s)
+    return out[:limit]

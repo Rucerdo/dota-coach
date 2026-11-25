@@ -139,3 +139,9 @@ def test_advisor_new_match_resets(gd):
     adv.update(_state())
     adv.update(_state(match_id="2"))
     assert adv.match_id == "2" and not adv.enemies
+
+
+def test_alternatives_only_best(gd):
+    """Dust y Gem resuelven lo mismo (detección): solo se sugiere uno."""
+    names = [s.item for s in suggest_items(gd, gd.hero("Juggernaut"), [gd.hero("Riki")])]
+    assert "item_dust" in names and "item_gem" not in names
