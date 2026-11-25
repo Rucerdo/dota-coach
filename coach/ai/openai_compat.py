@@ -18,7 +18,8 @@ PRESETS = {
     "openai": dict(label="ChatGPT (OpenAI)", base="https://api.openai.com/v1",
                    prefer=[r"^gpt-\d+(\.\d+)?-mini$", r"^gpt-\d+(\.\d+)?$"], reasoning=r"^(gpt-[5-9]|o\d)"),
     "gemini": dict(label="Gemini (Google)", base="https://generativelanguage.googleapis.com/v1beta/openai",
-                   prefer=[r"^gemini-[\d.]+-flash$", r"^gemini-[\d.]+-flash-lite$", r"gemini.*flash", r"gemini"],
+                   # Flash-Lite primero (como el traductor): mucha más cuota gratuita y más rápido; Flash de reserva
+                   prefer=[r"^gemini-[\d.]+-flash-lite$", r"^gemini-[\d.]+-flash$", r"gemini.*flash", r"gemini"],
                    reasoning=r"gemini-[2-9]"),
     "groq": dict(label="Groq", base="https://api.groq.com/openai/v1",
                  prefer=[r"^openai/gpt-oss-120b$", r"gpt-oss", r"^llama"], reasoning=r"gpt-oss|qwen3"),
@@ -30,7 +31,8 @@ PRESETS = {
                    reasoning=None, needs_key=False),
 }
 _SKIP = re.compile(r"audio|realtime|transcribe|tts|whisper|embed|image|moderation|search|guard|vision|codex", re.I)
-_OVERLOADED = (500, 502, 503, 504)  # el modelo está saturado o caído: se prueba el siguiente candidato
+# el modelo está saturado o caído, o se acabó SU cuota (429 es por modelo): se prueba el siguiente candidato
+_OVERLOADED = (429, 500, 502, 503, 504)
 _MAX_MODEL_SWITCHES = 3
 
 

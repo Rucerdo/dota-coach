@@ -79,6 +79,7 @@ class SettingsApp(ctk.CTk):
 
         self._build_coach()
         self._build_ai()
+        self._build_stratz()
         self._build_game()
         self._build_dota()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -352,6 +353,65 @@ class SettingsApp(ctk.CTk):
                 return
             self.btn_test.configure(state="normal")
             self.ai_status.configure(text=("✓ " if ok else "✗ ") + text, text_color=GREEN if ok else RED)
+        self.after(200, poll)
+
+    # ================= STRATZ =================
+    def _build_stratz(self):
+        from ..ai.secrets import decrypt_key
+        c = self._section("Estadísticas (STRATZ)", "Fuente principal de enfrentamientos y sinergias del draft: "
+                          "partidas públicas de tu rango. Necesita una clave gratuita (inicia sesión con Steam en "
+                          "stratz.com/api). Sin clave, o si falla, se usa OpenDota.")
+        self._label(c, 2, "Clave de STRATZ")
+        self.e_stratz = ctk.CTkEntry(c, height=32, fg_color=CARD2, border_color=CARD2, show="•")
+        self.e_stratz.grid(row=2, column=1, padx=16, pady=5, sticky="ew")
+        self.e_stratz.insert(0, decrypt_key(self.cfg.get("stratz_key_enc", "")))
+        self._stratz_loaded = self.e_stratz.get().strip()
+        self.e_stratz.bind("<FocusOut>", lambda _e: self._save_stratz())
+        row = ctk.CTkFrame(c, fg_color="transparent")
+        row.grid(row=3, column=0, columnspan=2, padx=16, pady=(8, 4), sticky="w")
+        self._button(row, "Conseguir clave", lambda: webbrowser.open("https://stratz.com/api")).pack(
+            side="left", padx=(0, 8))
+        self.btn_stratz = self._button(row, "Probar", self._test_stratz, primary=True, width=110)
+        self.btn_stratz.pack(side="left")
+        self.stratz_status = ctk.CTkLabel(c, text="", font=font(12), text_color=MUTED, wraplength=640,
+                                          justify="left")
+        self.stratz_status.grid(row=4, column=0, columnspan=2, padx=16, pady=(4, 16), sticky="w")
+
+    def _save_stratz(self):
+        from ..ai.secrets import encrypt_key
+        key = self.e_stratz.get().strip()
+        if key == self._stratz_loaded:
+            return
+        self._update(lambda cfg: cfg.__setitem__("stratz_key_enc", encrypt_key(key) if key else ""))
+        self._stratz_loaded = key
+        self.stratz_status.configure(text="Guardada.", text_color=MUTED)
+
+    def _test_stratz(self):
+        from ..data import stratz
+        self._save_stratz()
+        key = self.e_stratz.get().strip()
+        if not key:
+            self.stratz_status.configure(text="Falta la clave.", text_color=YELLOW)
+            return
+        self.stratz_status.configure(text="Probando…", text_color=MUTED)
+        self.btn_stratz.configure(state="disabled")
+        q: queue.Queue = queue.Queue()
+
+        def run():
+            try:
+                q.put((True, stratz.check(key)))
+            except Exception as ex:
+                q.put((False, str(ex)))
+        threading.Thread(target=run, daemon=True).start()
+
+        def poll():
+            try:
+                ok, text = q.get_nowait()
+            except queue.Empty:
+                self.after(200, poll)
+                return
+            self.btn_stratz.configure(state="normal")
+            self.stratz_status.configure(text=("✓ " if ok else "✗ ") + text, text_color=GREEN if ok else RED)
         self.after(200, poll)
 
     # ================= partida =================

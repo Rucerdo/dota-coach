@@ -15,6 +15,7 @@ from . import config, dota
 from .ai import make_provider
 from .ai.prompts import REVIEW_SCHEMA, review_prompt
 from .data import opendota
+from .data.sources import Sources
 from .data.gamedata import GameData, Hero
 from .engine import benchmarks
 from .engine.advisor import Advisor, Tip
@@ -114,7 +115,8 @@ def run_live(cfg: dict, gd: GameData, meta, manual_enemies: list[Hero] = (),
             lines.append("Upcoming: " + ", ".join(f"{t.label} in {t.seconds_left}s" for t in soon))
         return lines
 
-    advisor = Advisor(gd, meta, cfg, provider, on_tips, popularity=opendota.item_popularity,
+    stats_src = Sources(cfg.get("rank_bracket", 0))  # STRATZ (tu rango) o, de respaldo, OpenDota
+    advisor = Advisor(gd, meta, cfg, provider, on_tips, popularity=stats_src.popularity,
                       extra_context=extra_context)
     advisor.set_enemies(list(manual_enemies))
     current = {"team": "", "hero": None, "game": 0}
@@ -168,8 +170,10 @@ def run_live(cfg: dict, gd: GameData, meta, manual_enemies: list[Hero] = (),
 
         def job():
             try:
+                src = Sources(cfg.get("rank_bracket", 0))
                 view.picks = suggest_picks(gd, view.enemies, view.allies, cfg.get("role", "auto"), meta,
-                                           opendota.matchups, limit=8, banned=view.bans, synergy=opendota.synergy)
+                                           src.matchups, limit=8, banned=view.bans, synergy=src.synergy)
+                view.stats_source = " + ".join(sorted(set(src.last_source.values()))) or "meta"
             except Exception:
                 log.exception("no se pudieron calcular los picks")
             if draft_key["k"] == view.key:

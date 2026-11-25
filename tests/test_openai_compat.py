@@ -40,18 +40,25 @@ def _gemini(busy=(), model=""):
     return p
 
 
-def test_prefers_newest_stable_flash():
+def test_prefers_newest_stable_flash_lite():
     p = _gemini()
-    assert p.resolved_model() == "gemini-3.8-flash"
-    assert p._candidates[:3] == ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-2.5-flash"]
-    assert "gemini-3.5-flash-lite" in p._candidates  # Lite, como último recurso
+    assert p.resolved_model() == "gemini-3.5-flash-lite"       # como el traductor: más cuota gratuita
+    assert p._candidates[:3] == ["gemini-3.5-flash-lite", "gemini-3.8-flash", "gemini-3.7-flash"]
 
 
 def test_overloaded_model_switches_to_next():
-    p = _gemini(busy={"gemini-3.8-flash"})
-    assert p.complete("s", "u") == "hola desde gemini-3.7-flash"
-    assert p._session.posted == ["gemini-3.8-flash", "gemini-3.7-flash"]
-    assert p.resolved_model() == "gemini-3.7-flash"  # se queda con el que funciona
+    p = _gemini(busy={"gemini-3.5-flash-lite"})
+    assert p.complete("s", "u") == "hola desde gemini-3.8-flash"
+    assert p._session.posted == ["gemini-3.5-flash-lite", "gemini-3.8-flash"]
+    assert p.resolved_model() == "gemini-3.8-flash"  # se queda con el que funciona
+
+
+def test_quota_429_also_switches():
+    p = _gemini()
+    p._session.post = lambda url, json=None, **kw: (p._session.posted.append(json["model"]), Resp(
+        429, text="quota") if json["model"] == "gemini-3.5-flash-lite" else Resp(
+        200, {"choices": [{"message": {"content": "ok"}}]}))[1]
+    assert p.complete("s", "u") == "ok" and p.resolved_model() == "gemini-3.8-flash"
 
 
 def test_fixed_model_does_not_switch():

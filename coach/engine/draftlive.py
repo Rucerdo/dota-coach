@@ -24,6 +24,7 @@ class DraftView:
     bans: list[Hero] = field(default_factory=list)
     picks: list[PickSuggestion] = field(default_factory=list)
     source: str = ""             # gsi | visión
+    stats_source: str = ""       # STRATZ | OpenDota (de dónde salen enfrentamientos y sinergias)
     my_turn: bool = False
 
     @property

@@ -94,9 +94,12 @@ def cmd_draft(args, cfg, gd):
         sys.exit("Indica enemigos y/o aliados: --enemies \"pa, lion\" --allies \"cm\" (turbo: solo --allies)")
     meta = Meta.build(gd, cfg.get("rank_bracket", 0))
     role = args.role or cfg.get("role", "auto")
-    picks = suggest_picks(gd, enemies, allies, role, meta, opendota.matchups, limit=args.top, synergy=opendota.synergy)
+    from .data.sources import Sources
+    src = Sources(cfg.get("rank_bracket", 0))
+    picks = suggest_picks(gd, enemies, allies, role, meta, src.matchups, limit=args.top, synergy=src.synergy)
     who = (f"Contra {', '.join(h.loc for h in enemies)}" if enemies else "Pick a ciegas") +         (f" · con {', '.join(h.loc for h in allies)}" if allies else "")
-    print(f"{who} · rol {role} · parche {meta.patch}")
+    print(f"{who} · rol {role} · parche {meta.patch} · estadísticas: "
+          f"{' + '.join(sorted(set(src.last_source.values()))) or 'meta'}")
     for i, s in enumerate(picks, 1):
         print(f"{i:2}. {s.line()}")
     if args.ai:
@@ -119,7 +122,9 @@ def cmd_items(args, cfg, gd):
     enemies = _heroes(gd, args.enemies, "enemigos")
     owned = [it.name for it in (gd.item(x.strip()) for x in (args.owned or "").split(",")) if it]
     meta = Meta.build(gd, cfg.get("rank_bracket", 0))
-    pop = opendota.item_popularity(hero.id) if hero else None
+    from .data.sources import Sources
+    src = Sources(cfg.get("rank_bracket", 0))
+    pop = src.popularity(hero.id) if hero else None
     sugg = suggest_items(gd, hero, enemies, owned, args.role or cfg.get("role", "auto"), meta, pop, limit=args.top,
                          phase=phase_for(args.minute * 60))
     print(f"Fase: {PHASE_LABELS[phase_for(args.minute * 60)]} (minuto {args.minute})")
@@ -132,7 +137,7 @@ def cmd_items(args, cfg, gd):
         from .engine.advisor import Advisor
         from .gsi import GameState
         p = _provider_or_exit(cfg)
-        adv = Advisor(gd, meta, cfg, p, popularity=opendota.item_popularity, sync=True)
+        adv = Advisor(gd, meta, cfg, p, popularity=src.popularity, sync=True)
         adv.set_enemies(enemies)
         st = GameState(game_state="DOTA_GAMERULES_STATE_GAME_IN_PROGRESS", hero=hero.name if hero else "",
                        hero_id=hero.id if hero else 0, items=owned, gold=args.gold, clock=args.minute * 60)
@@ -166,6 +171,27 @@ def cmd_ai(args, cfg, gd=None):
             print(f"{p.label} · {p.resolved_model()}: " + p.complete("Reply in one short sentence.", "Say hi to a Dota player."))
         except LLMError as e:
             sys.exit(f"Error: {e}")
+
+
+def cmd_stratz(args, cfg, gd=None):
+    """Guardar la clave (cifrada), probarla o ver el esquema real de la API (para ajustar las consultas)."""
+    import json
+    from .ai.secrets import encrypt_key
+    from .data import stratz
+    if args.action == "set":
+        if not args.key:
+            sys.exit("Uso: coach stratz set --key <clave>  (se consigue en https://stratz.com/api)")
+        cfg["stratz_key_enc"] = encrypt_key(args.key.strip())
+        config.save(cfg)
+        print("Clave de STRATZ guardada (cifrada con tu usuario de Windows).")
+        return
+    try:
+        if args.action == "check":
+            print(stratz.check(stratz.token(cfg)))
+        else:
+            print(json.dumps(stratz.introspect(), ensure_ascii=False, indent=1))
+    except stratz.StratzError as e:
+        sys.exit(f"Error: {e}")
 
 
 def cmd_vision(args, cfg, gd):
@@ -346,6 +372,10 @@ def main(argv=None):
         p = sub.add_parser(name, help=f"{name} la integración GSI en Dota")
         p.add_argument("--dota-dir")
 
+    p = sub.add_parser("stratz", help="clave de STRATZ (estadísticas por rango): set, check o schema")
+    p.add_argument("action", choices=["set", "check", "schema"])
+    p.add_argument("--key")
+
     p = sub.add_parser("ai", help="configurar la IA")
     p.add_argument("action", choices=["set", "test", "off"])
     p.add_argument("provider", nargs="?", choices=PROVIDER_IDS)
@@ -383,6 +413,8 @@ def main(argv=None):
         return cmd_install(args, cfg)
     if args.cmd == "ai":
         return cmd_ai(args, cfg)
+    if args.cmd == "stratz":
+        return cmd_stratz(args, cfg)
     gd = GameData.load()
     {"meta": cmd_meta, "patch": cmd_patch, "draft": cmd_draft, "items": cmd_items, "run": cmd_run,
      "vision": cmd_vision}[args.cmd](args, cfg, gd)

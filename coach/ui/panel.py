@@ -580,7 +580,8 @@ class Panel(ctk.CTk):
                  "Mejores picks contra sus héroes" if d.enemies else
                  "Mejores picks con tu equipo (pick a ciegas)" if d.allies else "Picks fuertes en este parche")
         setw(self.d_title, text=title + turn, text_color=GREEN if d.my_turn else TEXT)
-        setw(self.cards["draft"]["extra"], text="datos de GSI" if d.source == "gsi" else "por la barra superior")
+        origin = "datos de GSI" if d.source == "gsi" else "por la barra superior"
+        setw(self.cards["draft"]["extra"], text=origin + (f" · estadísticas: {d.stats_source}" if d.stats_source else ""))
         self.pick_pool.update(d.picks[:6], self._set_pick)
 
     # ---------- informe de la última partida ----------

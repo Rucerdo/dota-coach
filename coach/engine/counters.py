@@ -241,9 +241,22 @@ def suggest_items(gd: GameData, my_hero: Hero | None, enemies: list[Hero], owned
                 if phase in ("mid", "late") and bare_component:
                     continue  # p. ej. Broadsword: a estas alturas se compra para fabricar otra cosa
                 if it and it.cost >= min_cost:
-                    add(it.name, weight * POPULARITY_WEIGHT * n / total, f"popular en {my_hero.loc if my_hero else 'tu héroe'}")
+                    details = popularity.get("_details_start" if key == "start_game_items" else "_details") or {}
+                    detail = details.get(str(item_id))
+                    who = my_hero.loc if my_hero else "tu héroe"
+                    scope = popularity.get("_scope", "")
+                    where = f" ({scope})" if scope else ""
+                    if detail and key == "start_game_items":
+                        reason = f"lo compra al salir el {detail[0]:.0%} de los {who}{where}"
+                    elif detail:
+                        reason = (f"lo compra el {detail[0]:.0%} de los {who}{where}, hacia el minuto "
+                                  f"{detail[1]:.0f} ({detail[2]:.0%} de victorias)")
+                    else:
+                        reason = f"popular en {who}"
+                    add(it.name, weight * POPULARITY_WEIGHT * n / total, reason)
 
-    backed = {name for name, s in sugg.items() if any(r.startswith("popular en") for r in s.reasons)}
+    backed = {name for name, s in sugg.items()
+              if any(r.startswith(("popular en", "lo compra el")) for r in s.reasons)}
     if standard:
         for name, (share, label) in standard.items():
             if share > 0:

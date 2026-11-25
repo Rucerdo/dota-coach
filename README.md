@@ -94,7 +94,7 @@ La build tiene en cuenta lo que llevas: no sugiere componentes de lo que ya est�
 | Partidas parecidas | OpenDota `findMatches` + `matches/{id}` |
 | Notas de parche | `dota2.com/datafeed/patchnotes` (JSON oficial de Valve) |
 | Winrates por rango y tendencia | OpenDota `heroStats` |
-| Matchups | OpenDota `heroes/{id}/matchups` (muestra pro, pequeña: se suaviza) |
+| Enfrentamientos y sinergias | STRATZ (partidas públicas de tu rango, con clave gratuita) o, de respaldo, OpenDota `heroes/{id}/matchups` y `explorer` (partidas pro: muestra pequeña, se suaviza) |
 | Objetos populares por héroe | OpenDota `heroes/{id}/itemPopularity` |
 
 Todo se guarda en caché (`%APPDATA%\DotaCoach\cache`): sin red se usa la última copia.

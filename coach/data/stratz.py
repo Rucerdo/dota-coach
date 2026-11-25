@@ -1,0 +1,172 @@
+"""STRATZ (api.stratz.com/graphql): estadísticas de partidas PÚBLICAS por rango. Fuente principal para
+enfrentamientos y sinergias; si no hay clave o algo falla, se usa OpenDota (ver data/sources.py).
+
+- Necesita una clave gratuita (stratz.com/api, iniciando sesión con Steam): cabecera "Authorization: Bearer <clave>"
+  y "User-Agent: STRATZ_API". Sin clave responde 403 ("A bearer token is required") — comprobado el 2026-11-25.
+- Los nombres de campos de las consultas vienen de la documentación conocida de STRATZ; `introspect()` pide el
+  esquema real a la API para comprobarlos cuando haya clave (`coach stratz check`).
+"""
+import logging
+import os
+
+import requests
+
+from .. import config
+from .cache import read_cached, write_cached
+
+log = logging.getLogger(__name__)
+
+URL = "https://api.stratz.com/graphql"
+KEY_PAGE = "https://stratz.com/api"
+HOUR = 3600
+
+# Rango de los ajustes (0 todos, 1 Herald ... 8 Immortal) → tramos de STRATZ
+BRACKETS = {1: "HERALD_GUARDIAN", 2: "HERALD_GUARDIAN", 3: "CRUSADER_ARCHON", 4: "CRUSADER_ARCHON",
+            5: "LEGEND_ANCIENT", 6: "LEGEND_ANCIENT", 7: "DIVINE_IMMORTAL", 8: "DIVINE_IMMORTAL"}
+
+
+class StratzError(Exception):
+    pass
+
+
+def token(cfg: dict | None = None) -> str:
+    """Clave guardada (cifrada) en la configuración o en la variable de entorno STRATZ_TOKEN."""
+    from ..ai.secrets import decrypt_key
+    cfg = cfg if cfg is not None else config.load()
+    return decrypt_key(cfg.get("stratz_key_enc", "")) or os.environ.get("STRATZ_TOKEN", "")
+
+
+def query(gql: str, variables: dict | None = None, key: str = "", timeout: float = 25.0) -> dict:
+    key = key or token()
+    if not key:
+        raise StratzError("sin clave de STRATZ")
+    try:
+        r = requests.post(URL, json={"query": gql, "variables": variables or {}}, timeout=timeout,
+                          headers={"Authorization": f"Bearer {key}", "User-Agent": "STRATZ_API",
+                                   "Content-Type": "application/json"})
+    except requests.RequestException as e:
+        raise StratzError(f"sin conexión con STRATZ ({e})") from e
+    if r.status_code in (401, 403):
+        raise StratzError("clave de STRATZ no válida")
+    if r.status_code == 429:
+        raise StratzError("STRATZ: límite de peticiones alcanzado")
+    if r.status_code >= 400:
+        raise StratzError(f"STRATZ respondió {r.status_code}: {r.text[:200]}")
+    data = r.json()
+    if data.get("errors"):
+        raise StratzError("STRATZ: " + "; ".join(str(e.get("message")) for e in data["errors"])[:300])
+    return data.get("data") or {}
+
+
+def cached_query(name: str, gql: str, variables: dict, ttl: float) -> dict:
+    hit = read_cached(name)
+    import time
+    if hit and time.time() - hit[0] < ttl:
+        return hit[1]
+    try:
+        data = query(gql, variables)
+    except StratzError:
+        if hit:
+            return hit[1]
+        raise
+    write_cached(name, data)
+    return data
+
+
+MATCHUP_GQL = """
+query Matchup($heroId: Short!, $brackets: [RankBracketBasicEnum]) {
+  heroStats {
+    matchUp(heroId: $heroId, bracketBasicIds: $brackets, take: 200) {
+      vs { heroId2 matchCount winCount }
+      with { heroId2 matchCount winCount }
+    }
+  }
+}"""
+
+
+def matchup(hero_id: int, bracket: int = 0) -> dict[str, list[dict]]:
+    """{'vs': [{hero_id, games, wins}], 'with': [...]}: 'wins' son las victorias de hero_id (contra o junto a)."""
+    brackets = [BRACKETS[bracket]] if bracket in BRACKETS else None
+    data = cached_query(f"stratz_matchup_{hero_id}_{bracket}", MATCHUP_GQL,
+                        {"heroId": int(hero_id), "brackets": brackets}, 24 * HOUR)
+    rows = ((data.get("heroStats") or {}).get("matchUp") or [{}])
+    block = rows[0] if isinstance(rows, list) and rows else rows or {}
+    out = {}
+    for kind in ("vs", "with"):
+        out[kind] = [{"hero_id": int(r["heroId2"]), "games": int(r.get("matchCount") or 0),
+                      "wins": int(r.get("winCount") or 0)} for r in block.get(kind) or [] if r.get("heroId2")]
+    return out
+
+
+ITEMS_GQL = """
+query Items($heroId: Short!, $brackets: [RankBracketBasicEnum]) {
+  heroStats {
+    itemFullPurchase(heroId: $heroId, bracketBasicIds: $brackets) { itemId instance time matchCount winCount }
+    itemStartingPurchase(heroId: $heroId, bracketBasicIds: $brackets) { itemId instance matchCount winCount }
+  }
+}"""
+
+# Fase según el minuto MEDIO de compra (mismos cortes que engine/counters.phase_for)
+PHASE_KEYS = ((12, "early_game_items"), (28, "mid_game_items"), (999, "late_game_items"))
+
+
+def item_popularity(hero_id: int, bracket: int = 0) -> dict:
+    """Lo que se compra con el héroe en tu rango, en el formato de OpenDota itemPopularity
+    ({start_game_items|early|mid|late: {item_id: partidas}}) más '_details' {item_id: (fracción, minuto, winrate)}.
+    Verificado con datos reales el 2026-11-25 (instance 0 = primera compra; time = minuto)."""
+    brackets = [BRACKETS[bracket]] if bracket in BRACKETS else None
+    data = cached_query(f"stratz_items_{hero_id}_{bracket}", ITEMS_GQL, {"heroId": int(hero_id), "brackets": brackets},
+                        24 * HOUR)
+    hs = data.get("heroStats") or {}
+    agg: dict[int, list[float]] = {}
+    for r in hs.get("itemFullPurchase") or []:
+        if r.get("instance", 0) != 0 or not r.get("itemId"):
+            continue
+        a = agg.setdefault(int(r["itemId"]), [0, 0, 0.0])
+        a[0] += int(r.get("matchCount") or 0)
+        a[1] += int(r.get("winCount") or 0)
+        a[2] += float(r.get("time") or 0) * int(r.get("matchCount") or 0)
+    start_rows = [r for r in hs.get("itemStartingPurchase") or [] if r.get("instance", 0) == 0 and r.get("itemId")]
+    starting: dict[int, int] = {}
+    start_wins: dict[int, int] = {}
+    for r in start_rows:  # con varios tramos de rango llega una fila por tramo: se suman
+        starting[int(r["itemId"])] = starting.get(int(r["itemId"]), 0) + int(r.get("matchCount") or 0)
+        start_wins[int(r["itemId"])] = start_wins.get(int(r["itemId"]), 0) + int(r.get("winCount") or 0)
+    total = max(starting.values(), default=0) or max((a[0] for a in agg.values()), default=0)  # ≈ partidas del héroe
+    scope = {"HERALD_GUARDIAN": "Herald-Guardian", "CRUSADER_ARCHON": "Crusader-Archon",
+             "LEGEND_ANCIENT": "Legend-Ancient", "DIVINE_IMMORTAL": "Divine-Immortal"}.get(
+        BRACKETS.get(bracket, ""), "todos los rangos")
+    out = {"start_game_items": {str(k): v for k, v in starting.items()},
+           "early_game_items": {}, "mid_game_items": {}, "late_game_items": {}, "_details": {}, "_total": total,
+           "_scope": scope,
+           "_details_start": {str(k): (v / total if total else 0.0, 0.0, start_wins[k] / v if v else 0.0)
+                              for k, v in starting.items()}}
+    for item_id, (matches, wins, tsum) in agg.items():
+        if not matches:
+            continue
+        minute = tsum / matches
+        key = next(k for limit, k in PHASE_KEYS if minute < limit)
+        out[key][str(item_id)] = matches
+        out["_details"][str(item_id)] = (matches / total if total else 0.0, minute, wins / matches)
+    return out
+
+
+def introspect(names=("HeroStatsQuery", "HeroMatchupType", "HeroDryadType", "RankBracketBasicEnum")) -> dict:
+    """Campos reales de los tipos que usamos (para comprobar las consultas cuando haya clave)."""
+    out = {}
+    for name in names:
+        data = query('query T($n: String!) { __type(name: $n) { name kind fields { name args { name } } '
+                     'enumValues { name } } }', {"n": name})
+        out[name] = data.get("__type")
+    return out
+
+
+def check(key: str) -> str:
+    """Prueba de la clave (botón "Probar" de los ajustes): una consulta pequeña de verdad."""
+    data = query(MATCHUP_GQL, {"heroId": 8, "brackets": None}, key=key)
+    rows = ((data.get("heroStats") or {}).get("matchUp") or [{}])
+    block = rows[0] if isinstance(rows, list) and rows else {}
+    return f"STRATZ responde: {len(block.get('vs') or [])} enfrentamientos de Juggernaut"
+
+
+__all__ = ["KEY_PAGE", "StratzError", "check", "introspect", "matchup", "query", "token"]
