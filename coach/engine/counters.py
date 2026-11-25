@@ -81,6 +81,12 @@ HARD_CARRIES = {
 # Peso de lo que se compra con tu héroe (OpenDota) frente a los counters
 POPULARITY_WEIGHT = 12
 
+# Partidas parecidas (tu héroe contra estos enemigos): lo que llevaban los ganadores es lo "estándar" y manda;
+# lo que no respalda ni eso ni la popularidad de tu héroe pierde peso (salvo la detección: siempre hace falta).
+STANDARD_WEIGHT = 6.0
+UNBACKED_FACTOR = 0.7
+ALWAYS_NEEDED = {"item_dust", "item_ward_sentry", "item_gem"}
+
 # Objetos que resuelven lo mismo: de cada grupo solo se sugiere el de más prioridad
 ALTERNATIVES = [{"item_dust", "item_gem"}, {"item_orchid", "item_bloodthorn"}]
 
@@ -198,8 +204,10 @@ def enemy_traits(enemies: list[Hero]) -> dict[str, list[str]]:
 
 def suggest_items(gd: GameData, my_hero: Hero | None, enemies: list[Hero], owned: list[str] = (),
                   role: str = "auto", meta=None, popularity: dict | None = None, limit: int = 6,
-                  phase: str | None = None) -> list[ItemSuggestion]:
-    """phase: start | early | mid | late (o None para toda la partida)."""
+                  phase: str | None = None, standard: dict[str, tuple[float, str]] | None = None
+                  ) -> list[ItemSuggestion]:
+    """phase: start | early | mid | late (o None para toda la partida).
+    standard: {item_*: (fracción 0-1, texto)} de partidas parecidas (lo que llevaban los que ganaron)."""
     role = item_role(my_hero, role)
     allowed = ROLE_ITEMS[role]
     owned = [o for o in owned if o]
@@ -234,6 +242,16 @@ def suggest_items(gd: GameData, my_hero: Hero | None, enemies: list[Hero], owned
                     continue  # p. ej. Broadsword: a estas alturas se compra para fabricar otra cosa
                 if it and it.cost >= min_cost:
                     add(it.name, weight * POPULARITY_WEIGHT * n / total, f"popular en {my_hero.loc if my_hero else 'tu héroe'}")
+
+    backed = {name for name, s in sugg.items() if any(r.startswith("popular en") for r in s.reasons)}
+    if standard:
+        for name, (share, label) in standard.items():
+            if share > 0:
+                add(name, STANDARD_WEIGHT * share, label)
+                backed.add(name)
+        for name, s in sugg.items():
+            if name not in backed and name not in ALWAYS_NEEDED:
+                s.priority *= UNBACKED_FACTOR
 
     # Seguir la ruta del jugador: lo que se fabrica con un objeto importante que ya lleva (aunque no esté en
     # ninguna lista) y, en todo lo sugerido, descontar del precio lo que ya tiene hecho.

@@ -36,3 +36,18 @@ def find_matches(team_a: list[int], team_b: list[int]) -> list[dict]:
 def match_details(match_id: int) -> dict:
     """Detalle de una partida (no cambia nunca: caché de un año)."""
     return cached_json(f"od_match_{match_id}", f"{OPENDOTA}/matches/{match_id}", 365 * 24 * HOUR)
+
+
+def synergy(hero_id: int, days: int = 180) -> list[dict]:
+    """Con quién gana más este héroe jugando en el MISMO equipo: [{hero_id, games, wins}] de partidas profesionales
+    recientes (OpenDota explorer; para partidas públicas no hay datos por parejas). Muestra pequeña: se suaviza."""
+    hero_id, days = int(hero_id), int(days)
+    sql = ("SELECT pm2.hero_id, count(*) games, "
+           "sum(CASE WHEN (pm1.player_slot < 128) = m.radiant_win THEN 1 ELSE 0 END) wins "
+           "FROM matches m JOIN player_matches pm1 USING(match_id) JOIN player_matches pm2 USING(match_id) "
+           f"WHERE pm1.hero_id = {hero_id} AND pm2.hero_id <> {hero_id} "
+           "AND (pm1.player_slot < 128) = (pm2.player_slot < 128) "
+           f"AND m.start_time > extract(epoch from now() - interval '{days} days') GROUP BY pm2.hero_id")
+    data = cached_json(f"od_synergy_{hero_id}", f"{OPENDOTA}/explorer", 24 * HOUR, params={"sql": sql}, timeout=40)
+    return [{"hero_id": int(r["hero_id"]), "games": int(r["games"]), "wins": int(r["wins"])}
+            for r in (data or {}).get("rows", [])]

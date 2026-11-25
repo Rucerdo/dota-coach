@@ -41,7 +41,8 @@ class Advisor:
                  popularity: Callable[[int], dict] | None = None, sync: bool = False,
                  extra_context: Callable[[GameState], list[str]] | None = None):
         self.gd, self.meta, self.cfg, self.provider = gd, meta, cfg, provider
-        self.extra_context = extra_context  # líneas extra para la IA: mapa, líneas, plan de compra, percentiles
+        self.extra_context = extra_context
+        self.standard: dict[str, tuple[float, str]] = {}  # de partidas parecidas (lo pone el modo en directo)  # líneas extra para la IA: mapa, líneas, plan de compra, percentiles
         self.on_tips, self.popularity, self.sync = on_tips, popularity, sync
         adv = cfg.get("advisor", {})
         self.min_ai_gap = float(adv.get("min_seconds_between_ai", 45))
@@ -67,6 +68,7 @@ class Advisor:
         self.recent: list[str] = []
         self.last_ai_call = 0.0
         self._known_enemy_count = 0
+        self.standard = {}
 
     def set_enemies(self, heroes: list[Hero]):
         """Enemigos indicados a mano o detectados en la barra superior."""
@@ -144,7 +146,7 @@ class Advisor:
             phase = phase_for(st.clock)
         return suggest_items(self.gd, hero, list(self.enemies.values()), st.all_items,
                              self.cfg.get("role", "auto"), self.meta, self._popularity(hero), limit=limit,
-                             phase=phase)
+                             phase=phase, standard=self.standard or None)
 
     def next_item(self, st: GameState) -> ItemSuggestion | None:
         sugg = self.suggestions(st)

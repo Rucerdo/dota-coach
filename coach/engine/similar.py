@@ -16,7 +16,7 @@ log = logging.getLogger(__name__)
 
 MIN_MATCHES = 5
 MAX_ENEMIES = 3           # con más, la búsqueda de OpenDota tarda demasiado y casi nunca encuentra partidas
-MAX_DETAILS = 10          # detalles de partida que se piden como mucho (límite gratuito de OpenDota)
+MAX_DETAILS = 15          # detalles de partida que se piden como mucho (límite gratuito de OpenDota)
 MIN_DURATION = 15 * 60    # las partidas muy cortas (abandonos, rendiciones) no enseñan una build
 SLOTS = [f"item_{i}" for i in range(6)] + [f"backpack_{i}" for i in range(3)]
 
@@ -40,6 +40,19 @@ class SimilarBuilds:
     @property
     def wins(self) -> int:
         return sum(m.win for m in self.matches)
+
+    def standard(self) -> dict[str, tuple[float, str]]:
+        """{item_*: (fracción, texto)}: lo que llevaban los ganadores (o todos, si hay menos de 2 victorias)."""
+        pool = [m for m in self.matches if m.win] if self.wins >= 2 else self.matches
+        if not pool:
+            return {}
+        counts: dict[str, int] = {}
+        for m in pool:
+            for name in set(m.items):
+                counts[name] = counts.get(name, 0) + 1
+        who = "ganadores" if self.wins >= 2 else "jugadores"
+        return {name: (n / len(pool), f"estándar en partidas parecidas: {n} de {len(pool)} {who}")
+                for name, n in counts.items() if n >= 2 or len(pool) <= 2}
 
 
 def _final_items(gd: GameData, player: dict) -> list[str]:

@@ -51,6 +51,7 @@ class GameState:
     last_hits: int = 0
     items: list[str] = field(default_factory=list)     # inventario + mochila + neutral (item_*)
     stash: list[str] = field(default_factory=list)
+    in_transit: list[str] = field(default_factory=list)  # en el courier (lo rellena engine/courier.py)
     visible_enemies: set[str] = field(default_factory=set)  # npc_dota_hero_* vistos en el minimapa
     visible_allies: set[str] = field(default_factory=set)
     x: int | None = None          # tu posición
@@ -77,7 +78,7 @@ class GameState:
 
     @property
     def all_items(self) -> list[str]:
-        return self.items + self.stash
+        return self.items + self.stash + self.in_transit
 
     @property
     def clock_text(self) -> str:

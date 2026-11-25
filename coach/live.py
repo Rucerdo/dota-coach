@@ -21,6 +21,7 @@ from .engine.advisor import Advisor, Tip
 from .engine.counters import item_role
 from .engine.draft import suggest_picks
 from .engine.draftlive import draft_state, is_drafting
+from .engine.courier import CourierTracker
 from .engine.events import EventWatch
 from .engine.mapwatch import MapWatch
 from .engine.matchlog import MatchLog, MatchReport, history, load_reports, save
@@ -77,6 +78,7 @@ def run_live(cfg: dict, gd: GameData, meta, manual_enemies: list[Hero] = (),
     timers = TimerWatch(enabled=cfg.get("timer_alerts", True))
     matchlog = MatchLog(gd)
     events = EventWatch(gd)
+    courier = CourierTracker(gd)
     bench: dict[int, dict] = {}       # héroe → referencias de OpenDota (se piden una vez, en segundo plano)
 
     def extra_context(st: GameState) -> list[str]:
@@ -152,6 +154,7 @@ def run_live(cfg: dict, gd: GameData, meta, manual_enemies: list[Hero] = (),
                 log.exception("no se pudieron buscar partidas parecidas")
                 result = None
             if similar_key["k"] == key:
+                advisor.standard = result.standard() if result else {}
                 panel.post("similar", result)
         threading.Thread(target=job, daemon=True).start()
 
@@ -166,7 +169,7 @@ def run_live(cfg: dict, gd: GameData, meta, manual_enemies: list[Hero] = (),
         def job():
             try:
                 view.picks = suggest_picks(gd, view.enemies, view.allies, cfg.get("role", "auto"), meta,
-                                           opendota.matchups, limit=8, banned=view.bans)
+                                           opendota.matchups, limit=8, banned=view.bans, synergy=opendota.synergy)
             except Exception:
                 log.exception("no se pudieron calcular los picks")
             if draft_key["k"] == view.key:
@@ -266,13 +269,14 @@ def run_live(cfg: dict, gd: GameData, meta, manual_enemies: list[Hero] = (),
 
     # ---------- cada envío de Dota ----------
     def on_state(st: GameState):
+        st.in_transit = courier.update(st)  # lo que lleva el courier cuenta como tuyo para la build
         current["team"] = st.team if st.team in ("radiant", "dire") else ""
         current["hero"] = gd.hero(st.hero) if st.hero else None
         advisor.update(st)  # detecta también la partida nueva (contra bots el match_id es siempre "0")
         if advisor.games.serial != current["game"]:
             current["game"] = advisor.games.serial
             finish_match()  # la anterior se dejó a medias: informe de lo que hubo
-            for part in (scanner, mapwatch, skills, timers, matchlog, events):
+            for part in (scanner, mapwatch, skills, timers, matchlog, events, courier):
                 if part:
                     part.reset()
             similar_key["k"] = draft_key["k"] = None

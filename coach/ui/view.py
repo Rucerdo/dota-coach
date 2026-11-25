@@ -62,6 +62,7 @@ class MatchView:
     items: list[str] = field(default_factory=list)
     inventory: list[tuple[str, str | None]] = field(default_factory=list)  # (casilla, item_* o None)
     stash: list[str] = field(default_factory=list)
+    in_transit: list[str] = field(default_factory=list)   # en el courier
     buy_now: PlanStep | None = None   # el siguiente componente que ya puedes pagar
     lanes: dict = field(default_factory=dict)  # top/mid/bot → LaneInfo (aliados y enemigos)
     my_lane: str | None = None
@@ -111,6 +112,7 @@ def build_view(advisor, meta, st: GameState, build_size: int = 6, mapwatch=None)
         inventory=[(slot, st.slots.get(slot)) for slot in INVENTORY_SLOTS],
         radiant_score=st.radiant_score, dire_score=st.dire_score,
         stash=[st.slots[k] for k in sorted(st.slots) if k.startswith("stash")],
+        in_transit=list(st.in_transit),
     )
     if mapwatch is not None:
         v.lanes, v.my_lane = mapwatch.lanes(), mapwatch.my_lane()

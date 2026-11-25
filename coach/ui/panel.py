@@ -546,11 +546,17 @@ class Panel(ctk.CTk):
         img = self.images.hero(p.hero, (64, 36))
         setw(row["portrait"], image=img, text="" if img else p.hero.loc[:2])
         setw(row["name"], text=p.hero.loc)
-        best = sorted(p.vs.items(), key=lambda kv: -kv[1])
-        good = ", ".join(f"{k} {v:+.1f}" for k, v in best[:2] if v > 0.5)
-        line = (f"bien contra {good}" if good else "") + (" · " if good and p.meta_line else "") + \
-            (p.meta_line.split(" · ")[0] if p.meta_line else "")
-        setw(row["why"], text=line if len(line) <= 60 else line[:58] + "…")
+        mates = sorted(p.with_.items(), key=lambda kv: -kv[1])
+        foes = sorted(p.vs.items(), key=lambda kv: -kv[1])
+        bits = []
+        if any(v > 0.5 for _, v in mates):
+            bits.append("con " + ", ".join(f"{k} {v:+.1f}" for k, v in mates[:2] if v > 0.5))
+        if any(v > 0.5 for _, v in foes):
+            bits.append("contra " + ", ".join(f"{k} {v:+.1f}" for k, v in foes[:2] if v > 0.5))
+        if p.meta_line and len(bits) < 2:
+            bits.append(p.meta_line.split(" · ")[0])
+        line = " · ".join(bits)
+        setw(row["why"], text=line if len(line) <= 64 else line[:62] + "…")
         row["tip"].text = p.line()
         setw(row["score"], text=f"{p.score:+.1f}", text_color=GREEN if p.score > 0 else RED)
 
@@ -567,11 +573,13 @@ class Panel(ctk.CTk):
             setw(self.d_title, text="")
             return
         self._empty("draft", None if d.picks else
-                    ("Cuando se vea algún héroe rival, aquí saldrán los mejores picks contra ellos."
-                     if not d.enemies else "Calculando…"))
+                    ("Calculando…" if d.allies or d.enemies else
+                     "En cuanto se vean héroes elegidos (de tu equipo o del rival) saldrán aquí los mejores picks."))
         turn = "  ·  ¡te toca elegir!" if d.my_turn else ""
-        setw(self.d_title, text=("Mejores picks contra sus héroes" if d.enemies else "Picks fuertes en este parche")
-             + turn, text_color=GREEN if d.my_turn else TEXT)
+        title = ("Mejores picks con tu equipo y contra el suyo" if d.enemies and d.allies else
+                 "Mejores picks contra sus héroes" if d.enemies else
+                 "Mejores picks con tu equipo (pick a ciegas)" if d.allies else "Picks fuertes en este parche")
+        setw(self.d_title, text=title + turn, text_color=GREEN if d.my_turn else TEXT)
         setw(self.cards["draft"]["extra"], text="datos de GSI" if d.source == "gsi" else "por la barra superior")
         self.pick_pool.update(d.picks[:6], self._set_pick)
 
@@ -723,34 +731,49 @@ class Panel(ctk.CTk):
         parts = [("✓ " if s.owned else "") + (s.loc if s.owned else f"{s.loc} ({s.to_pay})") for s in card.plan]
         return "\nOrden: " + " → ".join(parts)
 
-    # ---------- inventario ----------
+    # ---------- inventario (como en el juego: 3x3 con la mochila abajo; neutral y TP a la derecha) ----------
     def _build_inventory(self, body):
+        body.grid_columnconfigure(1, weight=1)
         grid = ctk.CTkFrame(body, fg_color="transparent")
-        grid.grid(row=0, column=0, sticky="w")
+        grid.grid(row=0, column=0, sticky="nw")
         self.inv_slots = {}
-        layout = [(f"slot{i}", 0, i, (56, 41)) for i in range(6)] + \
-                 [(f"slot{i}", 1, i - 6, (40, 29)) for i in range(6, 9)] + \
-                 [("neutral0", 1, 4, (40, 29)), ("teleport0", 1, 5, (40, 29))]
-        for slot, r, c, size in layout:
-            lbl = ctk.CTkLabel(grid, text="", width=size[0], height=size[1], fg_color=CARD2, corner_radius=4)
-            lbl.grid(row=r, column=c, padx=(0, 5), pady=(0, 5), sticky="w")
-            self.inv_slots[slot] = (lbl, size, Tooltip(lbl))
-        self.inv_note = ctk.CTkLabel(body, text="", font=font(10), text_color=MUTED, anchor="w")
-        self.inv_note.grid(row=1, column=0, sticky="w")
+        size, small = (58, 43), (58, 34)
+        for i in range(9):
+            r, c = divmod(i, 3)
+            backpack = i >= 6
+            lbl = ctk.CTkLabel(grid, text="", width=(small if backpack else size)[0],
+                               height=(small if backpack else size)[1], fg_color=BG if backpack else CARD2,
+                               corner_radius=4)
+            lbl.grid(row=r, column=c, padx=(0, 4), pady=(6 if backpack else 0, 4))
+            self.inv_slots[f"slot{i}"] = (lbl, small if backpack else size, Tooltip(lbl), backpack)
+        side = ctk.CTkFrame(body, fg_color="transparent")
+        side.grid(row=0, column=1, sticky="nw", padx=(10, 0))
+        for slot, label in (("neutral0", "Neutral"), ("teleport0", "TP")):
+            box = ctk.CTkFrame(side, fg_color="transparent")
+            box.pack(anchor="w", pady=(0, 6))
+            lbl = ctk.CTkLabel(box, text="", width=44, height=44, fg_color=CARD2, corner_radius=22)
+            lbl.pack(side="left")
+            ctk.CTkLabel(box, text=label, font=font(10), text_color=MUTED).pack(side="left", padx=(6, 0))
+            self.inv_slots[slot] = (lbl, (40, 30), Tooltip(lbl), False)
+        self.inv_transit = ctk.CTkLabel(side, text="", font=font(10, "bold"), text_color=CYAN, anchor="w",
+                                        justify="left", wraplength=190)
+        self.inv_transit.pack(anchor="w", pady=(6, 0))
+        self.inv_note = ctk.CTkLabel(side, text="", font=font(10), text_color=MUTED, anchor="w", justify="left",
+                                     wraplength=190)
+        self.inv_note.pack(anchor="w")
 
     def _render_inventory(self):
         v = self.view
         slots = dict(v.inventory) if v else {}
-        for slot, (lbl, size, tip) in self.inv_slots.items():
+        for slot, (lbl, size, tip, backpack) in self.inv_slots.items():
             name = slots.get(slot)
             img = self.images.item(name.removeprefix("item_"), size) if name else None
-            main = slot.startswith("slot") and int(slot[4:]) < 6
-            setw(lbl, image=img, text="" if img or not name else "?", fg_color=CARD2 if main else BG)
-            tip.text = self._loc(name) if name else ""
+            setw(lbl, image=img, text="" if img or not name else "?")
+            tip.text = (self._loc(name) + (" (mochila)" if backpack else "")) if name else ""
+        transit = v.in_transit if v else []
+        setw(self.inv_transit, text=("En el courier: " + ", ".join(self._loc(n) for n in transit)) if transit else "")
         stash = v.stash if v else []
-        if stash:
-            setw(self.inv_note, text="En el alijo: " + ", ".join(self._loc(s) for s in stash))
-        show(self.inv_note, bool(stash), row=1, column=0, sticky="w")
+        setw(self.inv_note, text=("En el alijo: " + ", ".join(self._loc(n) for n in stash)) if stash else "")
 
     def _loc(self, name: str) -> str:
         return (self.item_names or {}).get(name) or name.removeprefix("item_").replace("_", " ").title()

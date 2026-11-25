@@ -27,6 +27,7 @@ NEAR_DISTANCE = 2200
 TP_DISTANCE = 4500
 TP_WINDOW = 6                 # segundos entre la última vez que se vio y la nueva aparición
 COOLDOWN = 30
+QUIET_START = 60              # el primer minuto (y mientras estés en tu base) no hay avisos de enemigos cerca
 
 
 def zone(x: int, y: int) -> str:
@@ -124,8 +125,8 @@ class MapWatch:
             self.last_seen[u.name] = (clock, u.x, u.y)
             self.mia_warned.discard(u.name)
 
-        if me is None or not st.alive:
-            return alerts
+        if me is None or not st.alive or clock < QUIET_START or zone(me.x, me.y) == "base":
+            return alerts  # al salir de la fuente todos están juntos: no es un gank
         my_lane = self.my_lane()
         # enemigos cerca de ti
         near = [u for u in st.units if u.enemy and math.hypot(u.x - me.x, u.y - me.y) < NEAR_DISTANCE]

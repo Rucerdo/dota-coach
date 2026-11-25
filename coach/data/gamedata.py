@@ -9,7 +9,7 @@ import re
 import unicodedata
 from dataclasses import dataclass, field
 
-from .cache import cached_json
+from .cache import cached_json, read_cached, write_cached
 
 log = logging.getLogger(__name__)
 
@@ -17,6 +17,55 @@ VALVE = "https://www.dota2.com/datafeed"
 OPENDOTA = "https://api.opendota.com/api"
 CDN = "https://cdn.cloudflare.steamstatic.com"
 DAY = 86400
+
+
+def valve_recipes(itemlist: dict) -> dict[str, list[str]]:
+    """Recetas OFICIALES del parche actual (itemlist de Valve): item_recipe_X lista los ids de los componentes de X.
+    Devuelve {item_X: [componentes item_*]} sin las propias recetas."""
+    rows = itemlist["result"]["data"]["itemabilities"]
+    by_id = {i["id"]: i["name"] for i in rows}
+    out = {}
+    for i in rows:
+        name = i.get("name", "")
+        if not name.startswith("item_recipe_") or not i.get("recipes"):
+            continue
+        target = "item_" + name.removeprefix("item_recipe_")
+        comps = [by_id.get(x, "") for x in (i["recipes"][0].get("items") or [])]
+        comps = [c for c in comps if c and not c.startswith("item_recipe_")]
+        if comps:
+            out[target] = comps
+    return out
+
+
+def valve_item_costs(itemlist: dict, wanted: set[str], ttl: float = 3 * DAY) -> dict[str, int]:
+    """Coste OFICIAL de cada objeto (itemdata de Valve, uno por petición, en paralelo). Se guarda junto con la
+    versión del itemlist: con un parche nuevo se vuelve a pedir. Lo que falle se queda sin coste (se usa OpenDota)."""
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    import requests
+    ids = {i["name"]: i["id"] for i in itemlist["result"]["data"]["itemabilities"] if i["name"] in wanted}
+    stamp = str(len(itemlist["result"]["data"]["itemabilities"]))
+    hit = read_cached("valve_itemcosts")
+    if hit and time.time() - hit[0] < ttl and hit[1].get("stamp") == stamp and hit[1].get("costs"):
+        return hit[1]["costs"]
+    session = requests.Session()
+
+    def one(item):
+        name, item_id = item
+        try:
+            r = session.get(f"{VALVE}/itemdata", params={"language": "english", "item_id": item_id}, timeout=15)
+            data = r.json()["result"]["data"]["items"][0]
+            return name, int(data.get("item_cost") or 0)
+        except Exception:
+            return name, None
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        costs = {n: c for n, c in pool.map(one, ids.items()) if c is not None}
+    if costs:
+        write_cached("valve_itemcosts", {"stamp": stamp, "costs": costs})
+    elif hit:
+        return hit[1].get("costs", {})
+    return costs
 
 
 @dataclass
@@ -167,14 +216,24 @@ class GameData:
             heroes.append(Hero(id=h["id"], name=h["name"], loc=h["name_english_loc"] or h["name_loc"],
                                roles=od.get("roles") or [], attack_type=od.get("attack_type", ""),
                                aliases=aliases.get(h["id"], []), img=od.get("img", "")))
+        # Recetas y costes: los oficiales de Valve para el parche actual; OpenDota de respaldo (a veces va atrasado)
+        recipes = valve_recipes(itemlist)
+        wanted = set(recipes) | {c for comps in recipes.values() for c in comps} | {
+            f"item_{k}" for k, v in od_items.items() if isinstance(v, dict) and (v.get("cost") or 0) > 0}
+        try:
+            costs = valve_item_costs(itemlist, wanted)
+        except Exception as e:
+            log.warning("sin costes de Valve (%s): uso los de OpenDota", e)
+            costs = {}
         items = []
         for i in itemlist["result"]["data"]["itemabilities"]:
             if not i.get("name_english_loc") or i["name"].startswith("item_recipe"):
                 continue
             od = od_items.get(i["name"].removeprefix("item_"), {})
-            items.append(Item(id=i["id"], name=i["name"], loc=i["name_english_loc"],
-                              cost=int(od.get("cost") or 0), neutral_tier=int(i.get("neutral_item_tier", -1)),
-                              components=[f"item_{c}" for c in od.get("components") or [] if c]))
+            cost = costs.get(i["name"]) or int(od.get("cost") or 0)
+            comps = recipes.get(i["name"]) or [f"item_{c}" for c in od.get("components") or [] if c]
+            items.append(Item(id=i["id"], name=i["name"], loc=i["name_english_loc"], cost=cost,
+                              neutral_tier=int(i.get("neutral_item_tier", -1)), components=comps))
         abilities = {a["id"]: a["name_english_loc"] or a["name"]
                      for a in abilities_raw["result"]["data"]["itemabilities"] if a.get("id")}
         log.info("datos del juego: %d héroes, %d objetos, %d habilidades", len(heroes), len(items), len(abilities))

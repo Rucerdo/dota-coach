@@ -26,3 +26,18 @@ def test_relaxes_query_and_summarizes_winning_builds(gd):
 def test_no_enemies_or_no_matches(gd):
     assert find_similar(gd, gd.hero("Juggernaut"), []) is None
     assert find_similar(gd, gd.hero("Juggernaut"), [gd.hero("pa")], lambda a, b: [], lambda m: {}) is None
+
+
+def test_standard_items_drive_suggestions(gd):
+    from coach.engine.counters import suggest_items
+    from coach.engine.similar import SimilarBuilds, SimilarMatch
+    r = SimilarBuilds(gd.hero("Juggernaut"), [gd.hero("pa")], [
+        SimilarMatch(1, True, 2400, ["item_bfury", "item_black_king_bar"]),
+        SimilarMatch(2, True, 2400, ["item_bfury", "item_black_king_bar"]),
+        SimilarMatch(3, True, 2400, ["item_bfury"]),
+        SimilarMatch(4, False, 2400, ["item_mjollnir"])])
+    std = r.standard()
+    assert std["item_bfury"][0] == 1.0 and "3 de 3 ganadores" in std["item_bfury"][1]
+    assert "item_mjollnir" not in std                       # solo lo llevó el que perdió
+    names = [s.item for s in suggest_items(gd, gd.hero("Juggernaut"), [gd.hero("pa")], standard=std, phase="mid")]
+    assert names.index("item_bfury") < names.index("item_monkey_king_bar")

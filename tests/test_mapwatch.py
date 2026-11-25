@@ -54,3 +54,11 @@ def test_mia_and_stranger_near_and_tp(gd):
     # Riki salta de mid a top en 2 s: TP
     tp = mw.update(_st(154, [(JUGG, False, BOT_LANE), (RIKI, True, (-6200, 2000))]))
     assert any(a.kind == "tp" and "Riki" in a.text and "top" in a.text for a in tp)
+
+
+def test_no_near_alert_at_game_start_or_in_base(gd):
+    mw = MapWatch(gd)
+    fountain = (-6900, -6400)
+    assert not mw.update(_st(-60, [(JUGG, False, fountain), (PA, True, (-6600, -6100)), (LION, True, (-6700, -6300))]))
+    assert not mw.update(_st(20, [(JUGG, False, MID), (PA, True, (100, 100)), (LION, True, (-100, 50)),
+                                  (RIKI, True, (50, -50))]))

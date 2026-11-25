@@ -313,3 +313,25 @@ def test_draft_state_from_gsi_and_vision(gd):
     assert vis.source == "visión" and [h.loc for h in vis.enemies] == ["Riki"]
     picks = suggest_picks(gd, v.enemies, v.allies, banned=v.bans, matchups=lambda hid: [])
     assert all(p.hero.loc not in ("Phantom Assassin", "Juggernaut", "Lion") for p in picks)
+
+
+def test_valve_recipes_from_itemlist():
+    from coach.data.gamedata import valve_recipes
+    itemlist = {"result": {"data": {"itemabilities": [
+        {"id": 31, "name": "item_cloak"}, {"id": 21, "name": "item_ogre_axe"}, {"id": 61, "name": "item_vitality_booster"},
+        {"id": 691, "name": "item_recipe_eternal_shroud", "recipes": [{"items": [31, 21, 61]}]},
+        {"id": 48, "name": "item_travel_boots"}, {"id": 49, "name": "item_recipe_travel_boots"},
+        {"id": 220, "name": "item_recipe_travel_boots_2", "recipes": [{"items": [48, 49]}]},
+        {"id": 1, "name": "item_blink", "recipes": []}]}}}
+    r = valve_recipes(itemlist)
+    assert r == {"item_eternal_shroud": ["item_cloak", "item_ogre_axe", "item_vitality_booster"],
+                 "item_travel_boots_2": ["item_travel_boots"]}
+
+
+def test_draft_synergy_with_allies_in_blind_pick(gd):
+    """Turbo / pick a ciegas: sin enemigos, manda la sinergia con los aliados."""
+    syn = {5: [{"hero_id": 44, "games": 200, "wins": 140}, {"hero_id": 1, "games": 200, "wins": 60}]}
+    picks = suggest_picks(gd, [], [gd.hero("cm")], synergy=lambda hid: syn.get(hid, []))
+    names = [p.hero.loc for p in picks]
+    assert names[0] == "Phantom Assassin" and names[-1] == "Anti-Mage"
+    assert picks[0].with_["Crystal Maiden"] > 0 and "con Crystal Maiden" in picks[0].line()
