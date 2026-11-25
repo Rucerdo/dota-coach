@@ -33,7 +33,8 @@ class SkillWatch:
         self.pending_since: int | None = None
         self.warned_level = 0
 
-    def update(self, st: GameState) -> list[SkillAlert]:
+    def update(self, st: GameState, plan=None) -> list[SkillAlert]:
+        """plan: SkillPlan de engine/skillbuild (orden y talentos habituales); sin él, avisos genéricos."""
         if not st.in_game or not st.alive:
             return []
         points = unspent_points(st)
@@ -50,6 +51,13 @@ class SkillWatch:
         if st.level in ULT_LEVELS and ult and ult["level"] < ULT_LEVELS.index(st.level) + 1:
             return [SkillAlert(f"Nivel {st.level}: sube la definitiva", st.clock)]
         if st.level in TALENT_LEVELS:
-            return [SkillAlert(f"Nivel {st.level}: elige talento", st.clock)]
+            from .skillbuild import talent_for
+            t = talent_for(plan, st.level) if plan else None
+            hint = f": lo más elegido es «{t.pick}» ({t.share:.0%})" if t else ""
+            return [SkillAlert(f"Nivel {st.level}: elige talento{hint}", st.clock)]
+        from .skillbuild import next_skill
+        what = next_skill(plan, st) if plan else None
         extra = f" ({points} puntos)" if points > 1 else ""
+        if what:
+            return [SkillAlert(f"Sube {what}: punto de habilidad sin gastar{extra}", st.clock)]
         return [SkillAlert(f"Tienes un punto de habilidad sin gastar{extra}", st.clock)]

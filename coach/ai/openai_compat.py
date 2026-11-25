@@ -32,7 +32,8 @@ PRESETS = {
 }
 _SKIP = re.compile(r"audio|realtime|transcribe|tts|whisper|embed|image|moderation|search|guard|vision|codex", re.I)
 # el modelo está saturado o caído, o se acabó SU cuota (429 es por modelo): se prueba el siguiente candidato
-_OVERLOADED = (429, 500, 502, 503, 504)
+# 404: el modelo ya no existe o no está disponible para cuentas nuevas (p. ej. gemini-2.5-flash-lite)
+_OVERLOADED = (404, 429, 500, 502, 503, 504)
 _MAX_MODEL_SWITCHES = 3
 
 
@@ -87,6 +88,12 @@ class OpenAICompat(Provider):
                     if i not in candidates:
                         candidates.append(i)
             candidates = candidates or ids[:1]
+            if candidates and self._prefer:
+                # el mejor del patrón preferido primero; los más antiguos de ese mismo patrón, al final (suelen estar
+                # retirados): p. ej. 3.5-flash-lite, 3.8-flash, 3.7-flash..., 3.1-flash-lite, 2.5-flash-lite
+                first = re.compile(self._prefer[0])
+                head, rest = candidates[:1], candidates[1:]
+                candidates = head + [c for c in rest if not first.search(c)] + [c for c in rest if first.search(c)]
             chosen = candidates[0] if candidates else ""
             with self._lock:
                 self._candidates = candidates

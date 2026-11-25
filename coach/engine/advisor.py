@@ -21,7 +21,7 @@ from ..ai.base import LLMError, Provider
 from ..ai.prompts import TIPS_SCHEMA, tips_prompt
 from ..data.gamedata import GameData, Hero
 from ..gsi import GameState, GameTracker
-from .counters import (COUNTER_ITEMS, TRAIT_LABELS, ItemSuggestion, enemy_traits, item_role, phase_for,
+from .counters import (COUNTER_ITEMS, PHASES, TRAIT_LABELS, ItemSuggestion, enemy_traits, item_role, phase_for,
                        suggest_items)
 
 log = logging.getLogger(__name__)
@@ -140,13 +140,30 @@ class Advisor:
         return self._pop_cache[hero.id]
 
     def suggestions(self, st: GameState, phase: str | None = "auto", limit: int = 6) -> list[ItemSuggestion]:
-        """Objetos sugeridos para la fase actual de la partida (o la indicada)."""
+        """Objetos de la fase actual (o la indicada), cada uno en su fase. Con "auto", si ya tienes todo lo de tu
+        fase, se pasa a la siguiente."""
         hero = self.my_hero(st)
-        if phase == "auto":
-            phase = phase_for(st.clock)
-        return suggest_items(self.gd, hero, list(self.enemies.values()), st.all_items,
-                             self.cfg.get("role", "auto"), self.meta, self._popularity(hero), limit=limit,
-                             phase=phase, standard=self.standard or None)
+        pop = self._popularity(hero)
+
+        def run(ph):
+            return suggest_items(self.gd, hero, list(self.enemies.values()), st.all_items,
+                                 self.cfg.get("role", "auto"), self.meta, pop, limit=limit, phase=ph,
+                                 standard=self.standard or None, strict=ph is not None)
+        if phase != "auto":
+            return run(phase)
+        # tu fase primero (de ahí sale la siguiente compra) y después la siguiente: los objetivos a medio plazo
+        # (p. ej. la MKB contra PA en early) siguen a la vista para los consejos de counter y para la IA
+        out: list[ItemSuggestion] = []
+        upcoming = 0
+        for ph in PHASES[PHASES.index(phase_for(st.clock)):]:
+            fresh = [s for s in run(ph) if s.item not in {o.item for o in out}]
+            if out:  # ya hay objetos de tu fase: de las siguientes, solo los 3 primeros
+                fresh = fresh[:3 - upcoming]
+                upcoming += len(fresh)
+            out += fresh
+            if upcoming >= 3:
+                break
+        return out
 
     def next_item(self, st: GameState) -> ItemSuggestion | None:
         sugg = self.suggestions(st)

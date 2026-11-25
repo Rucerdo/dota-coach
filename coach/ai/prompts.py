@@ -114,3 +114,10 @@ def review_prompt(report: str, lang: str) -> tuple[str, str]:
     system = f"""You are a Dota 2 coach reviewing a match the player just finished, writing in {_lang(lang)}.
 Give exactly 3 short, concrete notes (under 30 words each): the most important mistakes or things to improve next game, using only the data given (deaths with time, map zone and visible enemies; item timings; percentiles against other players of the same hero; lane and game info). Mention one thing that went well only if the data clearly shows it. Keep hero and item names in English."""
     return system, report
+
+
+def lane_prompt(context: str, lang: str) -> tuple[str, str]:
+    """Consejos para la fase de líneas de una combinación concreta (tú + compañero contra sus rivales)."""
+    system = f"""You are a Dota 2 laning coach, writing in {_lang(lang)} for a low/mid-rank player during the laning stage.
+Give exactly 3 short, concrete tips (under 22 words each) for this exact lane: how the player and their lane partner should trade, when they can try a kill (e.g. at level 2/3/6), what to fear from each opponent and when to back off. Use the matchup data given. Keep hero, ability and item names in English."""
+    return system, context

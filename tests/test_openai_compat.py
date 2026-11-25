@@ -4,7 +4,7 @@ import pytest
 from coach.ai.base import LLMError
 from coach.ai.openai_compat import OpenAICompat
 
-MODELS = ["gemini-2.5-flash", "gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.5-flash-lite",
+MODELS = ["gemini-2.5-flash", "gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.5-flash-lite", "gemini-2.5-flash-lite",
           "gemini-3-flash-preview", "gemini-3.8-live", "gemma-4-31b-it"]
 
 
@@ -66,3 +66,13 @@ def test_fixed_model_does_not_switch():
     with pytest.raises(LLMError, match="503"):
         p.complete("s", "u")
     assert p._session.posted == ["gemini-3.8-flash"]
+
+
+def test_old_lites_go_last_and_404_switches():
+    p = _gemini()
+    p.resolved_model()
+    assert p._candidates[0] == "gemini-3.5-flash-lite" and p._candidates[-1] == "gemini-2.5-flash-lite"
+    p._session.post = lambda url, json=None, **kw: (p._session.posted.append(json["model"]), Resp(
+        404, text="no longer available") if json["model"] == "gemini-3.5-flash-lite" else Resp(
+        200, {"choices": [{"message": {"content": "ok"}}]}))[1]
+    assert p.complete("s", "u") == "ok" and p._session.posted == ["gemini-3.5-flash-lite", "gemini-3.8-flash"]

@@ -72,6 +72,8 @@ class SettingsApp(ctk.CTk):
         head.grid(row=0, column=0, sticky="ew", padx=24, pady=(18, 6))
         ctk.CTkLabel(head, text="DOTA", font=font(24, "bold"), text_color=ACCENT).pack(side="left")
         ctk.CTkLabel(head, text="  Coach", font=font(20, "bold"), text_color=TEXT).pack(side="left")
+        self.patch_status = ctk.CTkLabel(head, text="Comprobando el parche…", font=font(11), text_color=MUTED)
+        self.patch_status.pack(side="right")
         self.sc = ctk.CTkScrollableFrame(self, fg_color="transparent")
         self.sc.grid(row=1, column=0, sticky="nsew", padx=(18, 8), pady=(0, 14))
         self.sc.grid_columnconfigure(0, weight=1)
@@ -84,6 +86,35 @@ class SettingsApp(ctk.CTk):
         self._build_dota()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.after(1000, self._poll_process)
+        self._check_patch()
+
+    def _check_patch(self):
+        """Al abrir: ¿hay parche nuevo? (si lo hay, se renuevan los datos guardados). En segundo plano."""
+        q: queue.Queue = queue.Queue()
+
+        def run():
+            from ..data import updater
+            res = updater.check()
+            if res.error == "modo sin red":
+                q.put(res)
+                return
+            try:
+                from ..data.gamedata import GameData
+                res.missing_traits = updater.heroes_without_traits(GameData.load())
+            except Exception:
+                pass
+            q.put(res)
+        threading.Thread(target=run, daemon=True).start()
+
+        def poll():
+            try:
+                res = q.get_nowait()
+            except queue.Empty:
+                self.after(300, poll)
+                return
+            color = YELLOW if res.error or res.missing_traits else GREEN if res.new_patch else MUTED
+            self.patch_status.configure(text=res.message(), text_color=color)
+        self.after(300, poll)
 
     # ================= utilidades =================
     def _update(self, change):

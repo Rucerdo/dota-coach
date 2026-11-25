@@ -15,6 +15,7 @@ from typing import Callable
 log = logging.getLogger(__name__)
 
 TEAM_IDS = {"radiant": 2, "dire": 3}
+HERO_ICONS = {"minimap_herocircle", "minimap_herocircle_self", "minimap_enemyicon"}
 IN_GAME_STATES = {"DOTA_GAMERULES_STATE_PRE_GAME", "DOTA_GAMERULES_STATE_GAME_IN_PROGRESS"}
 
 
@@ -61,6 +62,7 @@ class GameState:
     abilities: list[dict] = field(default_factory=list)  # [{name, level, ultimate}] en orden
     attributes_level: int = 0
     talents: int = 0              # talentos elegidos
+    talent_flags: list[bool] = field(default_factory=list)  # talent_1..8 de GSI (por parejas: 10, 15, 20, 25)
     win_team: str = ""            # radiant | dire cuando acaba la partida
     draft: dict = field(default_factory=dict)  # {"radiant": [hero_id...], "dire": [...], "pick": bool, ...}
     xpm: int = 0
@@ -158,7 +160,8 @@ def parse_state(payload: dict) -> GameState:
         st.events.append(data)
     st.win_team = str(m.get("win_team") or "").lower().replace("none", "")
     st.attributes_level = _int(h.get("attributes_level"))
-    st.talents = sum(1 for i in range(1, 9) if h.get(f"talent_{i}") is True)
+    st.talent_flags = [h.get(f"talent_{i}") is True for i in range(1, 9)]
+    st.talents = sum(st.talent_flags)
     for key in sorted((payload.get("abilities") or {}), key=lambda k: _int(k.removeprefix("ability"))):
         a = payload["abilities"][key] or {}
         if a.get("name"):
@@ -184,12 +187,18 @@ def parse_state(payload: dict) -> GameState:
         team = _int(obj.get("team"), -1)
         if team not in (2, 3):
             continue
-        me = unit == st.hero
+        image = str(obj.get("image") or "")
+        if image and image not in HERO_ICONS:
+            # p. ej. minimap_plaincircle: en la fase de estrategia/previa Dota pone marcadores provisionales de TODOS
+            # los héroes con team=2 (comprobado en una sala personalizada): no dicen nada del bando
+            continue
+        me = unit == st.hero or image == "minimap_herocircle_self"
+        # el icono manda: enemyicon = enemigo, herocircle = aliado (más fiable que 'team')
+        enemy = image == "minimap_enemyicon" if image else (bool(my_team) and team != my_team)
         if "xpos" in obj and "ypos" in obj:
-            st.units.append(MapUnit(unit, team, _int(obj.get("xpos")), _int(obj.get("ypos")),
-                                    enemy=bool(my_team) and team != my_team, me=me))
-        if my_team and not me:
-            (st.visible_allies if team == my_team else st.visible_enemies).add(unit)
+            st.units.append(MapUnit(unit, team, _int(obj.get("xpos")), _int(obj.get("ypos")), enemy=enemy, me=me))
+        if not me and (my_team or image):
+            (st.visible_enemies if enemy else st.visible_allies).add(unit)
     return st
 
 

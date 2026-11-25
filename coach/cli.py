@@ -280,8 +280,11 @@ def cmd_autostart(args, cfg, gd=None):
     from .live import run_live
 
     def start(fresh_cfg, should_stop):
+        from .data import updater
+        update = updater.check()
         data = GameData.load()
-        run_live(fresh_cfg, data, Meta.build(data, fresh_cfg.get("rank_bracket", 0)), should_stop=should_stop)
+        run_live(fresh_cfg, data, Meta.build(data, fresh_cfg.get("rank_bracket", 0)), should_stop=should_stop,
+                 update=update)
     run_autostart(config.load, start)
 
 
@@ -318,7 +321,7 @@ def cmd_report(args, cfg, gd=None):
 def cmd_run(args, cfg, gd):
     from .live import run_live
     meta = Meta.build(gd, cfg.get("rank_bracket", 0))
-    run_live(cfg, gd, meta, _heroes(gd, args.enemies, "enemigos"))
+    run_live(cfg, gd, meta, _heroes(gd, args.enemies, "enemigos"), update=getattr(args, "update", None))
 
 
 def main(argv=None):
@@ -415,7 +418,12 @@ def main(argv=None):
         return cmd_ai(args, cfg)
     if args.cmd == "stratz":
         return cmd_stratz(args, cfg)
+    from .data import updater
+    update = updater.check()  # parche nuevo → se borra lo que depende de él antes de cargar los datos
+    if update.new_patch:
+        print(update.message())
     gd = GameData.load()
+    args.update = update
     {"meta": cmd_meta, "patch": cmd_patch, "draft": cmd_draft, "items": cmd_items, "run": cmd_run,
      "vision": cmd_vision}[args.cmd](args, cfg, gd)
 

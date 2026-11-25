@@ -49,6 +49,16 @@ class Sources:
         self.last_source["items"] = "OpenDota"
         return opendota.item_popularity(hero_id)
 
+    def hero_details(self, hero_id: int) -> dict | None:
+        """Orden de habilidades, talentos y fase de líneas (solo STRATZ: OpenDota no lo tiene)."""
+        if not self.use_stratz:
+            return None
+        try:
+            return stratz.hero_details(hero_id, self.bracket)
+        except Exception as e:
+            log.warning("STRATZ (habilidades de %s) no disponible: %s", hero_id, e)
+            return None
+
     def synergy(self, hero_id: int) -> list[dict]:
         rows = self._stratz(hero_id, "with")
         if rows is not None:

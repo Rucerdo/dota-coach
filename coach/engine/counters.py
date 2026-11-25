@@ -202,11 +202,37 @@ def enemy_traits(enemies: list[Hero]) -> dict[str, list[str]]:
     return out
 
 
+PHASE_BY_COST = ((2500, "early"), (5500, "mid"), (10 ** 9, "late"))  # sin datos de cuándo se compra
+
+
+def native_phase(gd: GameData, name: str, popularity: dict | None = None) -> str:
+    """La fase a la que pertenece un objeto: cuándo se suele comprar con tu héroe (STRATZ: minuto medio; OpenDota:
+    la fase en que más se compra) o, sin datos, por su precio. Cada objeto sale en UNA sola fase."""
+    item = gd.item(name)
+    pop = popularity or {}
+    if item is not None:
+        key = str(item.id)
+        if key in (pop.get("start_game_items") or {}) and item.cost <= PHASE_MAX_COST["start"]:
+            share = ((pop.get("_details_start") or {}).get(key) or (1.0,))[0]
+            if share >= 0.2:
+                return "start"
+        detail = (pop.get("_details") or {}).get(key)
+        if detail:
+            return phase_for(int(detail[1] * 60))
+        counts = {ph: (pop.get(k) or {}).get(key, 0) for ph, k in
+                  (("early", "early_game_items"), ("mid", "mid_game_items"), ("late", "late_game_items"))}
+        if any(counts.values()):
+            return max(counts.items(), key=lambda kv: kv[1])[0]
+    cost = item.cost if item else 0
+    return next(ph for limit, ph in PHASE_BY_COST if cost <= limit)
+
+
 def suggest_items(gd: GameData, my_hero: Hero | None, enemies: list[Hero], owned: list[str] = (),
                   role: str = "auto", meta=None, popularity: dict | None = None, limit: int = 6,
-                  phase: str | None = None, standard: dict[str, tuple[float, str]] | None = None
-                  ) -> list[ItemSuggestion]:
-    """phase: start | early | mid | late (o None para toda la partida).
+                  phase: str | None = None, standard: dict[str, tuple[float, str]] | None = None,
+                  strict: bool = False) -> list[ItemSuggestion]:
+    """phase: start | early | mid | late (o None para toda la partida). strict: solo los objetos de ESA fase
+    (native_phase), para que la build por fases no repita objetos ni meta los caros al principio.
     standard: {item_*: (fracción 0-1, texto)} de partidas parecidas (lo que llevaban los que ganaron)."""
     role = item_role(my_hero, role)
     allowed = ROLE_ITEMS[role]
@@ -294,6 +320,9 @@ def suggest_items(gd: GameData, my_hero: Hero | None, enemies: list[Hero], owned
                 review = meta.item_reviews.get(s.loc.lower()) if hasattr(meta, "item_reviews") else None
                 s.patch_note = (review or {}).get("summary") or "; ".join(c.text for c in changes[:2])
 
+    if strict and phase:
+        sugg = {k: s for k, s in sugg.items()
+                if k in ALWAYS_NEEDED or native_phase(gd, k, popularity) == phase}
     cap = PHASE_MAX_COST.get(phase)
     if cap:
         sugg = {k: s for k, s in sugg.items() if s.to_pay <= cap}

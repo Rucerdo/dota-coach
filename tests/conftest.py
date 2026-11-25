@@ -4,6 +4,7 @@ import os
 import tempfile
 
 os.environ["COACH_HOME"] = tempfile.mkdtemp(prefix="coach_test_")
+os.environ["COACH_OFFLINE"] = "1"  # nada de comprobar el parche contra Valve al abrir ventanas
 
 import pytest  # noqa: E402
 

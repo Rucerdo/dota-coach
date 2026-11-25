@@ -77,3 +77,18 @@ def test_parse_draft_tolerant():
     assert d["radiant"] == [8, "npc_dota_hero_juggernaut"] and d["dire"] == ["npc_dota_hero_lion"]
     assert d["radiant_bans"] == [44] and d["active"] == "dire" and d["pick"] and d["time_left"] == 25
     assert parse_draft(None) == {} and parse_draft({}) == {}
+
+
+def test_minimap_placeholders_in_strategy_time_are_ignored():
+    """En la fase de estrategia Dota pone marcadores de todos los héroes con team=2 (plaincircle): no son aliados."""
+    payload = {"map": {"game_state": "DOTA_GAMERULES_STATE_STRATEGY_TIME", "matchid": "1"},
+               "player": {"team_name": "radiant"}, "hero": {"name": "npc_dota_hero_skeleton_king"},
+               "minimap": {"o1": {"unitname": "npc_dota_hero_lina", "team": 2, "image": "minimap_plaincircle",
+                                  "xpos": 752, "ypos": -144},
+                           "o2": {"unitname": "npc_dota_hero_viper", "team": 2, "image": "minimap_herocircle",
+                                  "xpos": 0, "ypos": 0},
+                           "o3": {"unitname": "npc_dota_hero_sven", "team": 3, "image": "minimap_enemyicon",
+                                  "xpos": 10, "ypos": 10}}}
+    st = parse_state(payload)
+    assert st.visible_allies == {"npc_dota_hero_viper"} and st.visible_enemies == {"npc_dota_hero_sven"}
+    assert {u.name for u in st.units} == {"npc_dota_hero_viper", "npc_dota_hero_sven"}

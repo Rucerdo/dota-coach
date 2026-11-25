@@ -103,8 +103,45 @@ query Items($heroId: Short!, $brackets: [RankBracketBasicEnum]) {
   heroStats {
     itemFullPurchase(heroId: $heroId, bracketBasicIds: $brackets) { itemId instance time matchCount winCount }
     itemStartingPurchase(heroId: $heroId, bracketBasicIds: $brackets) { itemId instance matchCount winCount }
+    itemBootPurchase(heroId: $heroId, bracketBasicIds: $brackets) { itemId matchCount winCount timeAverage }
   }
 }"""
+
+HERO_GQL = """
+query Hero($heroId: Short!, $brackets: [RankBracketBasicEnum]) {
+  heroStats {
+    abilityMaxLevel(heroId: $heroId, bracketBasicIds: $brackets) { abilityId level matchCount }
+    abilityMinLevel(heroId: $heroId, bracketBasicIds: $brackets) { abilityId level matchCount }
+    talent(heroId: $heroId, bracketBasicIds: $brackets) { abilityId matchCount winCount timeAverage }
+    laneOutcome(heroId: $heroId, isWith: false, bracketBasicIds: $brackets) {
+      heroId2 matchCount winCount drawCount lossCount
+    }
+  }
+}"""
+
+
+def hero_details(hero_id: int, bracket: int = 0) -> dict:
+    """Orden de habilidades, talentos y fase de líneas del héroe en tu rango (verificado el 2026-11-25):
+    {'max_level': {abilityId: {nivel del héroe: partidas}}, 'min_level': {...}, 'talents': {abilityId: (partidas,
+    victorias)}, 'lanes': {heroId2: (partidas, ganadas, empatadas, perdidas)}} — con varios tramos, sumado."""
+    brackets = [BRACKETS[bracket]] if bracket in BRACKETS else None
+    data = cached_query(f"stratz_hero_{hero_id}_{bracket}", HERO_GQL, {"heroId": int(hero_id), "brackets": brackets},
+                        24 * HOUR)
+    hs = data.get("heroStats") or {}
+    out = {"max_level": {}, "min_level": {}, "talents": {}, "lanes": {}}
+    for key, field in (("max_level", "abilityMaxLevel"), ("min_level", "abilityMinLevel")):
+        for r in hs.get(field) or []:
+            levels = out[key].setdefault(int(r["abilityId"]), {})
+            levels[int(r["level"])] = levels.get(int(r["level"]), 0) + int(r.get("matchCount") or 0)
+    for r in hs.get("talent") or []:
+        m, w = out["talents"].get(int(r["abilityId"]), (0, 0))
+        out["talents"][int(r["abilityId"])] = (m + int(r.get("matchCount") or 0), w + int(r.get("winCount") or 0))
+    for r in hs.get("laneOutcome") or []:
+        prev = out["lanes"].get(int(r["heroId2"]), (0, 0, 0, 0))
+        add = (int(r.get("matchCount") or 0), int(r.get("winCount") or 0), int(r.get("drawCount") or 0),
+               int(r.get("lossCount") or 0))
+        out["lanes"][int(r["heroId2"])] = tuple(a + b for a, b in zip(prev, add))
+    return out
 
 # Fase según el minuto MEDIO de compra (mismos cortes que engine/counters.phase_for)
 PHASE_KEYS = ((12, "early_game_items"), (28, "mid_game_items"), (999, "late_game_items"))
@@ -132,7 +169,16 @@ def item_popularity(hero_id: int, bracket: int = 0) -> dict:
     for r in start_rows:  # con varios tramos de rango llega una fila por tramo: se suman
         starting[int(r["itemId"])] = starting.get(int(r["itemId"]), 0) + int(r.get("matchCount") or 0)
         start_wins[int(r["itemId"])] = start_wins.get(int(r["itemId"]), 0) + int(r.get("winCount") or 0)
-    total = max(starting.values(), default=0) or max((a[0] for a in agg.values()), default=0)  # ≈ partidas del héroe
+    for r in hs.get("itemBootPurchase") or []:  # las botas no vienen en itemFullPurchase
+        if not r.get("itemId"):
+            continue
+        a = agg.setdefault(int(r["itemId"]), [0, 0, 0.0])
+        n = int(r.get("matchCount") or 0)
+        a[0] += n
+        a[1] += int(r.get("winCount") or 0)
+        a[2] += float(r.get("timeAverage") or 0) / 60 * n  # timeAverage va en segundos
+    # partidas del héroe ≈ el objeto más comprado (casi todos compran tangos al salir); nunca menos que eso
+    total = max(max(starting.values(), default=0), max((a[0] for a in agg.values()), default=0))
     scope = {"HERALD_GUARDIAN": "Herald-Guardian", "CRUSADER_ARCHON": "Crusader-Archon",
              "LEGEND_ANCIENT": "Legend-Ancient", "DIVINE_IMMORTAL": "Divine-Immortal"}.get(
         BRACKETS.get(bracket, ""), "todos los rangos")
@@ -147,7 +193,7 @@ def item_popularity(hero_id: int, bracket: int = 0) -> dict:
         minute = tsum / matches
         key = next(k for limit, k in PHASE_KEYS if minute < limit)
         out[key][str(item_id)] = matches
-        out["_details"][str(item_id)] = (matches / total if total else 0.0, minute, wins / matches)
+        out["_details"][str(item_id)] = (min(1.0, matches / total) if total else 0.0, minute, wins / matches)
     return out
 
 

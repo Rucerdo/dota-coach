@@ -66,6 +66,12 @@ class MatchView:
     buy_now: PlanStep | None = None   # el siguiente componente que ya puedes pagar
     lanes: dict = field(default_factory=dict)  # top/mid/bot → LaneInfo (aliados y enemigos)
     my_lane: str | None = None
+    skill_plan: object = None      # SkillPlan (orden de habilidades y talentos habituales)
+    skill_now: str | None = None   # qué subir ahora si hay un punto sin gastar
+    abilities: list[dict] = field(default_factory=list)   # tus habilidades (GSI): nombre interno y nivel
+    talent_flags: list[bool] = field(default_factory=list)
+    lane_outlook: tuple | None = None  # (ganar, empatar, perder, partidas) contra tus rivales de línea
+    lane_report: object = None     # LaneReport: tu línea en detalle (rivales, compañero, consejos)
     percentiles: dict[str, float] = field(default_factory=dict)  # oro/min, XP/min, últimos golpes/min (0-1)
     events: object = None          # EventsState: torres de tu bando, asesinatos, rachas, compras de aliados
     radiant_score: int = 0
@@ -111,6 +117,7 @@ def build_view(advisor, meta, st: GameState, build_size: int = 6, mapwatch=None)
         role=ROLE_LABELS.get(item_role(hero, advisor.cfg.get("role", "auto")), ""),
         inventory=[(slot, st.slots.get(slot)) for slot in INVENTORY_SLOTS],
         radiant_score=st.radiant_score, dire_score=st.dire_score,
+        abilities=list(st.abilities), talent_flags=list(st.talent_flags),
         stash=[st.slots[k] for k in sorted(st.slots) if k.startswith("stash")],
         in_transit=list(st.in_transit),
     )

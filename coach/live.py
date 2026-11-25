@@ -39,7 +39,7 @@ POST_GAME = "DOTA_GAMERULES_STATE_POST_GAME"
 
 
 def run_live(cfg: dict, gd: GameData, meta, manual_enemies: list[Hero] = (),
-             should_stop: Callable[[], bool] | None = None):
+             should_stop: Callable[[], bool] | None = None, update=None):
     """should_stop: si devuelve True, el coach se cierra solo (lo usa el arranque automático al cerrar Dota)."""
     d = dota.normalize(cfg.get("dota_dir")) or dota.find_dota_dir()
     if d and not dota.is_installed(d, cfg["gsi_port"]):
@@ -80,7 +80,10 @@ def run_live(cfg: dict, gd: GameData, meta, manual_enemies: list[Hero] = (),
     matchlog = MatchLog(gd)
     events = EventWatch(gd)
     courier = CourierTracker(gd)
-    bench: dict[int, dict] = {}       # héroe → referencias de OpenDota (se piden una vez, en segundo plano)
+    bench: dict[int, dict] = {}
+    hero_info: dict[int, tuple] = {}  # héroe → (SkillPlan, detalles de STRATZ); se piden una vez en segundo plano
+    hero_synergy: dict[int, list] = {}  # héroe → con quién gana más (para tu compañero de línea)
+    lane_ai: dict[tuple, list[str]] = {}  # combinación de la línea → consejos de la IA (una vez por combinación)       # héroe → referencias de OpenDota (se piden una vez, en segundo plano)
 
     def extra_context(st: GameState) -> list[str]:
         """Lo que la IA no sabría solo con el estado del héroe: mapa, líneas, plan de compra, percentiles."""
@@ -136,6 +139,44 @@ def run_live(cfg: dict, gd: GameData, meta, manual_enemies: list[Hero] = (),
                 bench[hero.id] = benchmarks.fetch(hero.id)
             except Exception as e:
                 log.warning("sin referencias de OpenDota para %s: %s", hero.loc, e)
+        threading.Thread(target=job, daemon=True).start()
+
+    def ensure_hero_info(hero: Hero | None):
+        if hero is None or hero.id in hero_info:
+            return
+        hero_info[hero.id] = (None, None)
+
+        def job():
+            from .engine.skillbuild import build_plan, valve_hero
+            try:
+                hero_synergy[hero.id] = stats_src.synergy(hero.id)
+            except Exception:
+                hero_synergy[hero.id] = []
+            details = stats_src.hero_details(hero.id)
+            if not details:
+                return
+            try:
+                hero_info[hero.id] = (build_plan(valve_hero(hero.id), details), details)
+            except Exception:
+                log.exception("no se pudo preparar el orden de habilidades de %s", hero.loc)
+        threading.Thread(target=job, daemon=True).start()
+
+    def lane_tips_with_ai(rep):
+        """Consejos de la IA para tu línea, una vez por combinación de héroes (en segundo plano)."""
+        if provider is None or rep.key in lane_ai or not rep.opponents:
+            return
+        lane_ai[rep.key] = []
+
+        def job():
+            from .ai.prompts import REVIEW_SCHEMA, lane_prompt
+            from .engine.laning import lane_context
+            system, user = lane_prompt(lane_context(rep, gd), cfg.get("lang", "es"))
+            try:
+                data = json.loads(provider.complete(system, user, schema=REVIEW_SCHEMA, effort="low",
+                                                    max_tokens=2000, timeout=40))
+                lane_ai[rep.key] = [str(n).strip() for n in data.get("notes", []) if str(n).strip()][:3]
+            except Exception as e:
+                log.warning("la IA no pudo dar consejos de línea: %s", e)
         threading.Thread(target=job, daemon=True).start()
 
     def search_similar(st: GameState):
@@ -235,6 +276,22 @@ def run_live(cfg: dict, gd: GameData, meta, manual_enemies: list[Hero] = (),
             v.percentiles = benchmarks.live_percentiles(bench.get(hero.id, {}) if hero else {}, st.gpm, st.xpm,
                                                         st.last_hits, st.clock)
             v.drafting = is_drafting(st)
+            plan, details = hero_info.get(hero.id, (None, None)) if hero else (None, None)
+            if hero and mapwatch and st.in_game and st.clock < 15 * 60:  # la fase de líneas
+                from .engine.laning import build_report
+                rep = build_report(gd, mapwatch, hero, st.clock, details, hero_synergy.get(hero.id))
+                if rep:
+                    lane_tips_with_ai(rep)
+                    rep.ai_tips = lane_ai.get(rep.key, [])
+                    v.lane_report = rep
+            if plan:
+                from .engine.skillbuild import lane_outlook, next_skill
+                from .engine.skills import unspent_points
+                v.skill_plan = plan
+                v.skill_now = next_skill(plan, st) if unspent_points(st) else None
+                if mapwatch and details and mapwatch.my_lane():
+                    rivals = [h.id for h in mapwatch.lanes()[mapwatch.my_lane()].enemies]
+                    v.lane_outlook = lane_outlook(details, rivals)
             v.events = events.state
             panel.post("view", v)
         except Exception:
@@ -294,6 +351,8 @@ def run_live(cfg: dict, gd: GameData, meta, manual_enemies: list[Hero] = (),
             (feed.active.set if st.in_game else feed.active.clear)()
         hero = advisor.my_hero(st)
         ensure_bench(hero)
+        ensure_hero_info(hero)
+        plan = hero_info.get(hero.id, (None, None))[0] if hero else None
         timers.role = item_role(hero, cfg.get("role", "auto"))
         map_alerts = mapwatch.update(st) if mapwatch else []
         alerts = [Tip("map", a.text, "map", a.clock) for a in map_alerts]
@@ -307,7 +366,7 @@ def run_live(cfg: dict, gd: GameData, meta, manual_enemies: list[Hero] = (),
             for n in notices:
                 if n.toast:
                     panel.post("toast", {"title": n.title, "text": n.text, "level": n.level, "icon": n.kind})
-        alerts += [Tip("play", a.text, "rules", a.clock) for a in skills.update(st)]
+        alerts += [Tip("play", a.text, "rules", a.clock) for a in skills.update(st, plan)]
         alerts += [Tip("timer", a.text, "rules", a.clock) for a in timers.update(st.clock, st.in_game)]
         if alerts:
             on_tips(alerts)
@@ -328,6 +387,12 @@ def run_live(cfg: dict, gd: GameData, meta, manual_enemies: list[Hero] = (),
     gsi.start()
     if panel:
         panel.post("history", history(load_reports(30)))
+        if update is not None:
+            from .data.updater import heroes_without_traits
+            update.missing_traits = heroes_without_traits(gd)
+            if update.new_patch or update.missing_traits:
+                panel.post("toast", {"title": "Parche " + (update.latest or ""), "text": update.message(),
+                                     "level": "info", "icon": "patch"})
     if overlay:
         overlay.push("status", f"Dota Coach listo · parche {meta.patch} · {ai_label}")
     print(f"Dota Coach en marcha (parche {meta.patch}, {ai_label}). Ctrl+C para salir.")
