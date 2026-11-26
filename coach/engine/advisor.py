@@ -73,6 +73,8 @@ class Advisor:
         self.purchase_order: list[str] = []  # todo lo que has tenido, en orden
         self.bought_phase: dict[str, str] = {}
         self.phase_seen: dict[str, list[str]] = {}   # fase → objetos que se han sugerido en ella
+        self.enemy_items: dict[int, list[str]] = {}   # héroe enemigo → objetos vistos al seleccionarlo
+        self.enemy_items_at: dict[int, int] = {}      # héroe enemigo → reloj de la partida cuando se vio
         if hasattr(self, "paths"):
             self.paths.builds.clear()            # eran de tu héroe de la partida anterior
         self.announced_items: set[str] = set()
@@ -213,7 +215,8 @@ class Advisor:
         def run(ph):
             return suggest_items(self.gd, hero, list(self.enemies.values()), st.all_items,
                                  self.cfg.get("role", "auto"), self.meta, pop, limit=limit, phase=ph,
-                                 standard=standard or None, strict=ph is not None, turbo=st.turbo)
+                                 standard=standard or None, strict=ph is not None, turbo=st.turbo,
+                                 enemy_items=self.enemy_items)
         if phase != "auto":
             return run(phase)
         # tu fase primero (de ahí sale la siguiente compra) y después la siguiente: los objetivos a medio plazo
@@ -249,7 +252,7 @@ class Advisor:
             if st.clock > 30 * 60 and st.gold < st.buyback_cost + 500:
                 tips.append(Tip("warning", "Guarda oro para el buyback a partir de ahora", "rules", st.clock))
         if "start" in triggers or "enemy" in triggers or "periodic" in triggers:
-            traits = enemy_traits(list(self.enemies.values()))
+            traits = enemy_traits(list(self.enemies.values()), self.enemy_items)
             if traits:
                 # el rasgo más repetido que tenga un counter de verdad entre las sugerencias (no basta con que
                 # el objeto mencione a esos héroes por otro motivo: BKB no es un counter de la curación)

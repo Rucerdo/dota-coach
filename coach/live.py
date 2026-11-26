@@ -115,6 +115,14 @@ def run_live(cfg: dict, gd: GameData, meta, manual_enemies: list[Hero] = (),
         if pct:
             lines.append("Percentiles vs other players of this hero: " +
                          ", ".join(f"{k} {benchmarks.describe(v)}" for k, v in pct.items()))
+        seen = []
+        for hid, items in advisor.enemy_items.items():
+            hero = advisor.enemies.get(hid)
+            if hero and items:
+                ago = max(0, st.clock - advisor.enemy_items_at.get(hid, st.clock)) // 60
+                seen.append(f"{hero.loc} ({ago} min ago): " + ", ".join(gd.item(i).loc for i in items if gd.item(i)))
+        if seen:
+            lines.append("Enemy items seen when the player selected them: " + "; ".join(seen))
         ult_line = ults.context(st.clock)
         if ult_line:
             lines.append(ult_line)
@@ -128,6 +136,7 @@ def run_live(cfg: dict, gd: GameData, meta, manual_enemies: list[Hero] = (),
                       extra_context=extra_context)
     advisor.set_enemies(list(manual_enemies))
     current = {"team": "", "hero": None, "game": 0, "st": None}
+    kills_noted = {"n": 0}   # muertes ya pasadas a la vigilancia del mapa
 
     # ---------- definitivas enemigas (las marcas tú con Ctrl+F1…F5) ----------
     ult_info: dict[int, object] = {}   # id del héroe → Ult | None (datos de Valve, se piden una vez)
@@ -229,7 +238,9 @@ def run_live(cfg: dict, gd: GameData, meta, manual_enemies: list[Hero] = (),
         """Builds reales de STRATZ de tu héroe: generales y, por cada enemigo que aparece, unas cuantas contra él."""
         if hero is None or not stats_src.use_stratz:
             return
-        wanted = [(hero.id, None, 30)] + [(hero.id, e.id, 8) for e in advisor.enemies.values()]
+        from .engine.guides import PER_ENEMY
+        # las mismas consultas que el buscador de guías (misma caché: al abrirlo, ya está todo)
+        wanted = [(hero.id, None, 60)] + [(hero.id, e.id, PER_ENEMY) for e in advisor.enemies.values()]
         todo = [w for w in wanted if w[:2] not in builds_asked]
         if not todo:
             return
@@ -249,19 +260,67 @@ def run_live(cfg: dict, gd: GameData, meta, manual_enemies: list[Hero] = (),
         threading.Thread(target=job, daemon=True).start()
 
     # ---------- guías (buscador en el panel) ----------
-    def fetch_guides(hero_id: int) -> list:
-        """Guías de un héroe: generales y, si es tu héroe, contra tus enemigos y con tus aliados."""
+    def fetch_guides(hero_id: int, progress=None) -> list:
+        """Guías de un héroe. Si es tu héroe: parejas enemigo+aliado de tu partida, cada uno por separado y
+        generales (en paralelo); si no, solo generales. progress(hechas, total, texto, guías hasta ahora)."""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
         from .data import stratz
-        from .engine.guides import guides_from_rows
+        from .engine.guides import guides_from_rows, queries
         if not stratz.token(cfg):
             raise RuntimeError("falta la clave de STRATZ (ajustes)")
-        rows = list(stratz.hero_builds(hero_id, take=30))
-        if hero_id == advisor.my_hero_id:
-            for e in list(advisor.enemies.values()):
-                rows += stratz.hero_builds(hero_id, against=e.id, take=8)
-            for a in list(advisor.allies.values()):
-                rows += stratz.hero_builds(hero_id, with_hero=a.id, take=5)
+        mine = hero_id == advisor.my_hero_id
+        enemies = list(advisor.enemies) if mine else []
+        allies = [a for a in advisor.allies if a != hero_id] if mine else []
+        todo = queries(hero_id, enemies, allies) if mine else [(None, None, 60, "generales")]
+        name = lambda hid: gd.heroes[hid].loc if hid in gd.heroes else "?"   # noqa: E731
+
+        def label(q):
+            against, with_hero, _, kind = q
+            if kind == "pareja":
+                return f"contra {name(against)} con {name(with_hero)}"
+            if kind == "contra":
+                return f"contra {name(against)}"
+            if kind == "con":
+                return f"con {name(with_hero)}"
+            return "generales"
+        rows: list[dict] = []
+        failed = 0
+        lock = threading.Lock()
+        counts = {i: [0, q[2]] for i, q in enumerate(todo)}   # consulta → [partidas leídas, total]
+
+        def report(text, partial):
+            if progress:
+                with lock:
+                    done, total = sum(c[0] for c in counts.values()), sum(c[1] for c in counts.values())
+                progress(done, max(total, 1), text, partial)
+
+        def run(i, q):
+            def on_batch(done, total):
+                with lock:
+                    counts[i] = [done, max(total, 1)]
+                report(f"{label(q)}: {done}/{total} partidas", None)
+            return stratz.hero_builds(hero_id, q[0], q[1], q[2], on_batch=on_batch)
+        report(f"Buscando partidas de {len(todo)} enfrentamientos…", [])
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = {pool.submit(run, i, q): (i, q) for i, q in enumerate(todo)}
+            for fut in as_completed(futures):
+                i, q = futures[fut]
+                try:
+                    got = fut.result()
+                    rows += got
+                    with lock:
+                        counts[i] = [max(counts[i][1], 1)] * 2
+                    text = f"{label(q)}: {len(got)} partidas"
+                except Exception as ex:
+                    failed += 1
+                    with lock:
+                        counts[i] = [counts[i][1]] * 2
+                    text = f"{label(q)}: falló ({str(ex)[:60]})"
+                report(text, guides_from_rows(gd, hero_id, rows))
+        if mine:
             advisor.paths.add(rows)
+        if failed == len(todo):
+            raise RuntimeError("STRATZ no respondió")
         return guides_from_rows(gd, hero_id, rows)
 
     def save_guide(guide):
@@ -284,12 +343,29 @@ def run_live(cfg: dict, gd: GameData, meta, manual_enemies: list[Hero] = (),
         if st is not None:
             push_view(st, force=True)
 
+    KEY_TRAITS = {"invis", "illusions", "evasion", "heal", "summons", "disables", "buffs", "passives"}
+
     def guide_context():
+        """Para ordenar las guías: tus rivales de línea pesan más (1.5), los enemigos que piden counters (1.25),
+        tu compañero de línea (1.2) más que el resto de aliados (0.8)."""
+        from .engine.counters import TRAITS
         position = ""
         g = advisor.follower.guide
         if g and g.hero_id == advisor.my_hero_id:
             position = g.position
-        return advisor.my_hero_id or None, set(advisor.enemies), set(advisor.allies), position
+        weights: dict[int, float] = {}
+        for h in advisor.enemies.values():
+            if KEY_TRAITS & set(TRAITS.get(h.loc, [])):
+                weights[h.id] = 1.25
+        lane = mapwatch.my_lane() if mapwatch else None
+        if lane:
+            info = mapwatch.lanes()[lane]
+            for h in info.enemies:
+                weights[h.id] = 1.5
+            for h in info.allies:
+                if h.id != advisor.my_hero_id:
+                    weights[h.id] = 1.2
+        return advisor.my_hero_id or None, set(advisor.enemies), set(advisor.allies), position, weights
 
     def on_deviation(what: str):
         st = current["st"]
@@ -316,10 +392,120 @@ def run_live(cfg: dict, gd: GameData, meta, manual_enemies: list[Hero] = (),
             except (TypeError, ValueError):
                 log.warning("guía guardada no válida para %s", hero.loc)
 
+    # ---------- la guía en la tienda de Dota (solo cuando el jugador lo pide) ----------
+    def shop_status(hero_id: int) -> tuple[bool, str | None]:
+        """(la build de ese héroe en Dota es del coach, id de la guía que lleva). Se mira el archivo: vale para
+        cualquier partida futura aunque se cierre el coach."""
+        from . import itembuilds
+        d = dota.find_dota_dir()
+        hero = gd.heroes.get(hero_id)
+        if not d or not hero:
+            return False, None
+        gid = itembuilds.exported_guide(d, hero.name)
+        return gid is not None, gid
+
+    def shop_export(guide) -> str:
+        """Sustituye la guía por defecto de Dota de ese héroe por la elegida (objetos, habilidades y talentos)."""
+        from . import itembuilds
+        from .engine.skillbuild import build_plan, valve_hero
+        d = dota.find_dota_dir()
+        if not d:
+            raise RuntimeError("no encuentro la carpeta de Dota")
+        hero = gd.heroes[guide.hero_id]
+        pop = stats_src.popularity(hero.id) or {}
+        start = [gd.items[int(k)].name for k, _ in sorted((pop.get("start_game_items") or {}).items(),
+                                                          key=lambda kv: -kv[1])[:6] if int(k) in gd.items]
+        counters = []
+        if hero.id == advisor.my_hero_id:
+            counters = [s.item for s in advisor.suggestions(current["st"], phase=None, limit=6)] \
+                if current["st"] is not None else []
+        vh = valve_hero(hero.id)
+        plan = hero_info.get(hero.id, (None, None))[0]
+        if plan is None:
+            details = stats_src.hero_details(hero.id)
+            plan = build_plan(vh, details) if details else None
+        lines, order = itembuilds.skill_lines(plan, vh)
+        role = f" {guide.role}" if guide.role else ""
+        title = f"Dota Coach | {hero.loc}{role} [guía {guide.id}]"
+        path = itembuilds.export(d, hero.name, title, itembuilds.groups_for_guide(guide, start, counters),
+                                 lines, order)
+        return str(path)
+
+    def shop_restore(hero_id: int) -> bool:
+        from . import itembuilds
+        d = dota.find_dota_dir()
+        hero = gd.heroes.get(hero_id)
+        return bool(d and hero and itembuilds.restore(d, hero.name))
+
     if panel:
         panel.actions.update(guides=dict(gd=gd, fetch=fetch_guides, choose=choose_guide,
-                                         current=lambda: advisor.follower.guide, context=guide_context),
+                                         current=lambda: advisor.follower.guide, context=guide_context,
+                                         shop=dict(status=shop_status, export=shop_export, restore=shop_restore)),
                              deviation=on_deviation)
+
+    # ---------- objetos de los enemigos (al seleccionarlos, se leen del HUD) ----------
+    inv_stop = threading.Event()
+    DANGER_ITEMS = {"item_black_king_bar", "item_blink", "item_overwhelming_blink", "item_swift_blink",
+                    "item_arcane_blink", "item_desolator", "item_butterfly", "item_monkey_king_bar",
+                    "item_greater_crit", "item_sheepstick", "item_satanic", "item_refresher", "item_aeon_disk",
+                    "item_sphere", "item_ghost", "item_glimmer_cape", "item_silver_edge", "item_invis_sword",
+                    "item_gem", "item_abyssal_blade", "item_bloodthorn", "item_nullifier", "item_skadi",
+                    "item_radiance", "item_ultimate_scepter", "item_dagon_5", "item_rapier"}
+
+    def inventory_watch():
+        from .data.cache import download_file
+        from .data.gamedata import CDN
+        from .engine.skillbuild import valve_hero
+        from .vision.inventory import InventoryReader, capture_hud
+        item_dir, ability_dir = config.CACHE_DIR / "item_img", config.CACHE_DIR / "ability_img"
+        reader = InventoryReader(item_dir, ability_dir)
+        names = [it.name for it in gd.items.values() if it.cost > 0 and not it.name.startswith("item_recipe")]
+        for n in names:  # iconos de todos los objetos (una vez; luego están en caché)
+            if inv_stop.is_set():
+                return
+            p = item_dir / f"{n.removeprefix('item_')}.png"
+            if not p.exists():
+                download_file(f"{CDN}/apps/dota2/images/dota_react/items/{n.removeprefix('item_')}.png", p)
+        reader.load_items(names)
+        pending: dict[int, list[str]] = {}
+        while not inv_stop.wait(0.5):
+            st = current["st"]
+            if st is None or not st.in_game or not advisor.enemies:
+                continue
+            for h in list(advisor.enemies.values()):
+                if h.id not in reader.heroes:
+                    abilities = [a["name"] for a in valve_hero(h.id).get("abilities") or []]
+                    for a in abilities:
+                        p = ability_dir / f"{a}.png"
+                        if not p.exists():
+                            download_file(f"{CDN}/apps/dota2/images/dota_react/abilities/{a}.png", p)
+                    reader.load_hero(h.id, abilities)
+            try:
+                hud = capture_hud()
+                sel = reader.read(hud, list(advisor.enemies.values()), list(gd.heroes.values())) \
+                    if hud is not None else None
+            except Exception:
+                log.exception("no se pudo leer el inventario del seleccionado")
+                continue
+            if sel is None or sel.hero_id is None:
+                continue
+            if sel.hero_id not in advisor.enemies and sel.hero_id in gd.heroes:
+                advisor.set_enemies([gd.heroes[sel.hero_id]])   # leído su nombre con la barra roja: es enemigo
+            items = [i for i in sel.items if i]
+            if pending.get(sel.hero_id) != items:
+                pending[sel.hero_id] = items   # se confirma en la lectura siguiente (evita lecturas a medias)
+                continue
+            before = advisor.enemy_items.get(sel.hero_id)
+            advisor.enemy_items[sel.hero_id] = items
+            advisor.enemy_items_at[sel.hero_id] = st.clock
+            if before != items:
+                hero = advisor.enemies.get(sel.hero_id)
+                new = [i for i in items if i in DANGER_ITEMS and i not in (before or [])]
+                if hero and new and panel and cfg.get("toasts", True):
+                    names_new = ", ".join(gd.item(i).loc for i in new if gd.item(i))
+                    panel.post("toast", {"title": hero.loc, "text": f"Lleva {names_new}", "level": "warn",
+                                         "icon": "item"})
+                push_view(st, force=True)
 
     def lane_tips_with_ai(rep):
         """Consejos de la IA para tu línea, una vez por combinación de héroes (en segundo plano)."""
@@ -504,6 +690,7 @@ def run_live(cfg: dict, gd: GameData, meta, manual_enemies: list[Hero] = (),
                 if part:
                     part.reset()
             similar_key["k"] = draft_key["k"] = None
+            kills_noted["n"] = 0
             builds_asked.clear()
             if panel:
                 panel.post("reset")
@@ -527,6 +714,9 @@ def run_live(cfg: dict, gd: GameData, meta, manual_enemies: list[Hero] = (),
             for k in events.state.kills:
                 if k.victim and k.killer_enemy is False and st.clock - k.clock <= 5:
                     mapwatch.mark_dead(k.victim.name, k.clock)   # muerto: no está "desaparecido"
+            for k in events.state.kills[kills_noted["n"]:]:
+                mapwatch.note_kill(k.clock)                       # muertes seguidas = pelea en equipo
+            kills_noted["n"] = len(events.state.kills)
         alerts += [Tip("warning", n.text, "rules", n.clock) for n in notices]
         if panel and cfg.get("toasts", True):
             titles = {"mia": ("Enemigo desaparecido", "warn"), "near": ("¡Gank!", "danger"), "tp": ("TP enemigo", "warn")}
@@ -563,6 +753,9 @@ def run_live(cfg: dict, gd: GameData, meta, manual_enemies: list[Hero] = (),
         if hotkeys.failed:
             panel.post("toast", {"title": "Atajos de definitivas", "level": "warn", "icon": "ult",
                                  "text": "Windows no dejó registrar: " + ", ".join(hotkeys.failed)})
+
+    if cfg.get("enemy_items", True):
+        threading.Thread(target=inventory_watch, name="inventario", daemon=True).start()
 
     recorder = GSIRecorder(config.APP_DIR / "gsi_record.jsonl") if cfg.get("record_gsi", True) else None
     gsi = GSIServer(cfg["gsi_port"], on_state, recorder)
@@ -616,6 +809,7 @@ def run_live(cfg: dict, gd: GameData, meta, manual_enemies: list[Hero] = (),
         except Exception:
             log.exception("no se pudo cerrar el informe de la partida")
         gsi.stop()
+        inv_stop.set()
         if hotkeys:
             hotkeys.stop()
         if feed:

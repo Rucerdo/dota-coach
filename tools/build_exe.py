@@ -18,6 +18,7 @@ args = [
     "--add-data", f"{ROOT / 'coach' / 'engine' / 'hero_traits.json'};coach/engine",
     "--collect-data", "customtkinter",
     "--hidden-import", "comtypes.stream",
+    "--collect-all", "winrt",          # OCR de Windows (paquetes de PyWinRT: módulos nativos por espacio de nombres)
     "--distpath", str(ROOT / "dist"),
     "--workpath", str(ROOT / "build"),
     "--specpath", str(ROOT / "build"),

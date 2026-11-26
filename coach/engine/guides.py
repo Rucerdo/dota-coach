@@ -61,14 +61,29 @@ def guides_from_rows(gd: GameData, hero_id: int, rows: list[dict]) -> list[Guide
     return out
 
 
-def similarity(g: Guide, enemies: set[int], allies: set[int], position: str = "") -> float:
-    """Para ordenar el buscador: enemigos en común (lo que más pesa), aliados y misma posición."""
-    return len(enemies & set(g.enemies)) + 0.4 * len(allies & set(g.allies)) + (0.5 if position and
-                                                                                 g.position == position else 0)
+def coincidences(g: Guide, enemies: set[int], allies: set[int]) -> tuple[int, int]:
+    """(enemigos en común, aliados en común) con tu partida."""
+    return len(enemies & set(g.enemies)), len(allies & set(g.allies))
 
 
-def rank(guides: list[Guide], enemies: set[int], allies: set[int], position: str = "") -> list[Guide]:
-    return sorted(guides, key=lambda g: (similarity(g, enemies, allies, position), len(g.core)), reverse=True)
+ALLY_WEIGHT = 0.8          # un aliado en común cuenta algo menos que un enemigo (la build va contra ellos)
+
+
+def similarity(g: Guide, enemies: set[int], allies: set[int], position: str = "",
+               weights: dict[int, float] | None = None) -> float:
+    """Para ordenar el buscador: héroes de tu partida (enemigos y aliados) que estaban también en esa, cada uno con
+    su peso (weights: tus rivales de línea y los enemigos que piden counters pesan más; ver live.guide_context).
+    Tu héroe está siempre (son guías de tu héroe). A igualdad, la misma posición."""
+    w = weights or {}
+    score = sum(w.get(h, 1.0) for h in enemies & set(g.enemies))
+    score += sum(w.get(h, ALLY_WEIGHT) for h in allies & set(g.allies))
+    return score + (0.05 if position and g.position == position else 0)
+
+
+def rank(guides: list[Guide], enemies: set[int], allies: set[int], position: str = "",
+         weights: dict[int, float] | None = None) -> list[Guide]:
+    return sorted(guides, key=lambda g: (similarity(g, enemies, allies, position, weights), len(g.core)),
+                  reverse=True)
 
 
 @dataclass
@@ -139,4 +154,19 @@ class GuideFollower:
         return _lcs(bought, self.guide.items) / len(bought)
 
 
-__all__ = ["Deviation", "Guide", "GuideFollower", "guides_from_rows", "rank", "similarity"]
+PER_ENEMY = 120
+
+
+def queries(hero_id: int, enemies: list[int], allies: list[int]) -> list[tuple[int | None, int | None, int, str]]:
+    """Qué pedir a STRATZ (tu héroe va siempre): tu héroe contra cada enemigo, con todas las partidas que haya
+    (5 consultas). Después se suman las coincidencias de cada guía con TODOS los héroes de la partida. Sin
+    enemigos conocidos: guías generales. [(contra, con, cuántas, etiqueta)]"""
+    if not enemies:
+        return [(None, None, 60, "generales")]
+    # una consulta por enemigo con TODAS sus partidas (STRATZ tiene ~80-110 por enfrentamiento): ~500 partidas que
+    # se combinan; las coincidencias con los demás héroes (enemigos y aliados) salen de ahí
+    return [(e, None, PER_ENEMY, "contra") for e in enemies]
+
+
+__all__ = ["Deviation", "Guide", "GuideFollower", "coincidences", "guides_from_rows", "queries", "rank",
+           "similarity"]

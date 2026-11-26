@@ -47,7 +47,8 @@ PALETTES = {
     "day": {"bg": "#13110D", "card": "#221D16", "header": "#2A2219", "clock": "#F5C542"},
     "night": {"bg": "#090E1A", "card": "#121A2B", "header": "#152038", "clock": "#9FC3FF"},
 }
-TOAST_ICONS = {"mia": "?", "near": "⚔", "tp": "↯", "tower": "♜", "streak": "☠", "patch": "⚑", "ult": "✦"}
+TOAST_ICONS = {"mia": "?", "near": "⚔", "tp": "↯", "tower": "♜", "streak": "☠", "patch": "⚑", "ult": "✦",
+               "item": "⛨"}
 MAX_TIPS = 60
 
 
@@ -310,6 +311,9 @@ class Panel(ctk.CTk):
 
     # ---------- entrada (cualquier hilo) ----------
     def post(self, kind: str, payload=None):
+        if kind == "toast" and isinstance(payload, dict):
+            import time
+            payload = {**payload, "created": payload.get("created") or time.time()}
         self.q.put((kind, payload))
 
     # ---------- estructura ----------
@@ -734,7 +738,7 @@ class Panel(ctk.CTk):
                     setw(lbl, text=f"T{tier} {frac:.0%}", text_color=color, fg_color=CARD2)
         streaks = sorted((ev.streaks if ev else {}).items(), key=lambda kv: -kv[1])
         setw(self.b_streak, text=("Rachas: " + ", ".join(f"{h} {n}" for h, n in streaks[:3])) if streaks else "")
-        kills = list(reversed(ev.kills[-4:])) if ev else []
+        kills = list(reversed(ev.kills[-6:])) if ev else []   # las últimas (todas quedan en el informe)
         self.kill_pool.update(kills, self._set_kill)
         buys = ev.purchases[-3:] if ev else []
         setw(self.b_buys, text=("Compras de aliados: " + " · ".join(f"{h}: {i}" for _, h, i in reversed(buys)))
@@ -1227,6 +1231,14 @@ class Panel(ctk.CTk):
             verdict.pack(side="left", padx=(6, 0))
             traits = ctk.CTkLabel(f, text="", font=font(10), text_color=MUTED, anchor="w", height=16)
             traits.grid(row=1, column=1, sticky="ew", pady=(0, 3))
+            items_row = ctk.CTkFrame(f, fg_color="transparent", width=1, height=1)
+            item_icons = []
+            for j in range(9):
+                lbl = ctk.CTkLabel(items_row, text="", width=30, height=22, fg_color=BG, corner_radius=3)
+                lbl.grid(row=0, column=j, padx=(0, 2))
+                item_icons.append((lbl, Tooltip(lbl)))
+            items_ago = ctk.CTkLabel(items_row, text="", font=font(9), text_color=MUTED, height=22)
+            items_ago.grid(row=0, column=10, padx=(6, 0))
             # definitiva: icono + cuenta atrás (la marcas con Ctrl+F1…F5 al verla)
             ult_box = ctk.CTkFrame(f, fg_color="transparent", width=1, height=1)
             ult_box.grid(row=0, column=2, rowspan=2, padx=(4, 2))
@@ -1246,7 +1258,8 @@ class Panel(ctk.CTk):
                 counters.append({"frame": icon, "icon": icon, "tip": Tooltip(icon), "col": j})
             tips = Tooltip(traits)
             return {"frame": f, "portrait": portrait, "name": name, "wr": wr, "verdict": verdict, "traits": traits,
-                    "traits_tip": tips, "counters": counters, "ult_box": ult_box, "ult_icon": ult_icon,
+                    "traits_tip": tips, "counters": counters, "items_row": items_row, "item_icons": item_icons,
+                    "items_ago": items_ago, "ult_box": ult_box, "ult_icon": ult_icon,
                     "ult_text": ult_text, "ult_tip": ult_tip}
         self.enemy_pool = Pool(factory)
 
@@ -1263,6 +1276,20 @@ class Panel(ctk.CTk):
         traits = ", ".join(e.traits) or "–"
         setw(row["traits"], text=traits if len(traits) <= 46 else traits[:44] + "…")
         self._set_enemy_ult(row, e)
+        show(row["items_row"], bool(e.items), row=2, column=0, columnspan=4, sticky="w", padx=6, pady=(0, 5))
+        for j, (lbl, tip) in enumerate(row["item_icons"]):
+            name = e.items[j] if j < len(e.items) else None
+            if not name:
+                show(lbl, False)
+                continue
+            show(lbl, True, row=0, column=j, padx=(0, 2))
+            img = self.images.item(name.removeprefix("item_"), (30, 22))
+            setw(lbl, image=img, text="" if img else "?")
+            tip.text = name.removeprefix("item_").replace("_", " ")
+        if e.items:
+            ago = e.items_ago or 0
+            setw(row["items_ago"], text="objetos vistos ahora" if ago < 10 else
+                 f"objetos vistos hace {ago // 60} min" if ago >= 60 else f"objetos vistos hace {ago} s")
         row["traits_tip"].text = traits
         for slot, card in zip(row["counters"], e.counters + [None] * (3 - len(e.counters))):
             if card is None:  # hueco vacío pero en su sitio: así la definitiva queda alineada en todas las filas
@@ -1512,7 +1539,7 @@ class Panel(ctk.CTk):
                     self.similar, self.similar_state = None, "buscando"
                 elif kind == "toast":
                     self.toast.show(payload.get("title", ""), payload.get("text", ""), payload.get("level", "info"),
-                                    TOAST_ICONS.get(payload.get("icon", ""), "●"))
+                                    TOAST_ICONS.get(payload.get("icon", ""), "●"), payload.get("created"))
                 elif kind == "draft":
                     self.draft = payload
                 elif kind == "report":

@@ -107,3 +107,22 @@ def test_a_single_position_glitch_is_not_a_tp(gd):
     alerts += mw.update(_st(122, [(JUGG, False, BOT_LANE), (PA, True, (5200, -5600))]))
     alerts += mw.update(_st(124, [(JUGG, False, BOT_LANE), (PA, True, (5250, -5600))]))
     assert not [a for a in alerts if a.kind == "tp"]
+
+
+def test_no_gank_alerts_during_a_teamfight(gd):
+    mw = MapWatch(gd)
+    _laning(mw)
+    # 3 contra 3 a tu alrededor: es una pelea en equipo, no un gank
+    fight = [(JUGG, False, BOT_LANE), (CM, False, (5150, -5650)), (RIKI, False, (5300, -5500)),
+             (PA, True, (5200, -5600)), (LION, True, (5250, -5700)), ("npc_dota_hero_antimage", True, (5350, -5600))]
+    assert not mw.update(_st(900, fight))
+    assert mw.in_fight(915)                                     # y unos segundos después, tampoco
+    assert not mw.in_fight(925)
+    # dos muertes seguidas también cuentan como pelea
+    mw2 = MapWatch(gd)
+    _laning(mw2)
+    mw2.note_kill(1000)
+    assert not mw2.in_fight(1001)
+    mw2.note_kill(1008)
+    assert mw2.in_fight(1010)
+    assert not mw2.update(_st(1010, [(JUGG, False, BOT_LANE), (PA, True, (5200, -5600)), (LION, True, (5250, -5700))]))

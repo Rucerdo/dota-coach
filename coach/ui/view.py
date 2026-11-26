@@ -40,6 +40,8 @@ class HeroCard:
     counters: list[ItemCard] = field(default_factory=list)  # qué comprar contra ESTE héroe
     hotkey: str = ""                                   # Ctrl+F1…F5 para marcar su definitiva
     slot: int | None = None                            # hueco 0-4 de su bando, si la visión lo ha reconocido
+    items: list[str] = field(default_factory=list)     # objetos vistos al seleccionarlo (item_*)
+    items_ago: int | None = None                       # segundos desde que se vieron
     ult_name: str = ""                                 # icono de Valve (p. ej. enigma_black_hole)
     ult_loc: str = ""
     ult_left: tuple[int, int] | None = None            # segundos que le faltan (mín, máx); None = sin marcar
@@ -124,11 +126,12 @@ def _card(gd, name: str, reason: str) -> ItemCard | None:
 
 
 def hero_card(hero: Hero, meta, gd=None, my_hero: Hero | None = None, role: str = "auto",
-              owned: list[str] = ()) -> HeroCard:
-    card = HeroCard(hero, [TRAIT_LABELS.get(t, t) for t in enemy_traits([hero])])
+              owned: list[str] = (), items: list[str] = ()) -> HeroCard:
+    card = HeroCard(hero, [TRAIT_LABELS.get(t, t) for t in enemy_traits([hero], {hero.id: list(items)})],
+                    items=list(items))
     if gd is not None:
-        card.counters = [c for c in (_card(gd, n, why) for n, why in counters_for(gd, hero, my_hero, role, owned))
-                         if c]
+        card.counters = [c for c in (_card(gd, n, why) for n, why in
+                                     counters_for(gd, hero, my_hero, role, owned, items=list(items))) if c]
     hm = meta.hero(hero) if meta is not None else None
     if hm:
         card.winrate = hm.winrate if hm.picks else None
@@ -207,7 +210,11 @@ def build_view(advisor, meta, st: GameState, build_size: int = 6, mapwatch=None,
     role = advisor.cfg.get("role", "auto")
     # en el orden de la barra superior (el de los atajos Ctrl+F1…F5)
     order = [h for h in (enemy_slots or []) if h] or list(advisor.enemies.values())
-    v.enemies = [hero_card(h, meta, advisor.gd, hero, role, st.all_items) for h in order]
+    seen_items = getattr(advisor, "enemy_items", {})
+    v.enemies = [hero_card(h, meta, advisor.gd, hero, role, st.all_items, seen_items.get(h.id, ())) for h in order]
+    for card in v.enemies:
+        at = getattr(advisor, "enemy_items_at", {}).get(card.hero.id)
+        card.items_ago = max(0, st.clock - at) if at is not None else None
     for i, card in enumerate(v.enemies):
         card.slot = (confirmed_slots or {}).get(card.hero.id)
         if ult_keys and enemy_slots:

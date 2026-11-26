@@ -133,3 +133,15 @@ def test_ult_badges_under_enemy_portraits(gd, panel):
     badges.update(v)
     assert not badges.badges[5].shown
     badges.destroy()
+
+
+def test_stale_toasts_are_dropped(panel):
+    import time
+    from coach.ui.toast import MAX_AGE, ToastManager
+    m = ToastManager(panel, "panel")
+    m.show("Viejo", "de hace rato", created=time.time() - MAX_AGE - 1)
+    assert not m.toasts                                          # caducado: no se enseña
+    m.show("Nuevo", "ahora")
+    assert len(m.toasts) == 1
+    for t in m.toasts:
+        t.win.destroy()

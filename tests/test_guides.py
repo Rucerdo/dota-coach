@@ -52,3 +52,19 @@ def test_view_uses_guide_for_next_purchase(gd):
     assert v.guide and (v.guide.done, v.guide.total) == (1, 3)
     assert v.next_item.name == "item_bfury" and "tu guía" in v.next_item.reasons[0]
     assert v.deviation is None
+
+
+def test_pair_queries_and_ranking_by_coincidences(gd):
+    from coach.engine.guides import coincidences, queries, similarity
+    q = queries(8, [44, 26], [5])
+    assert q == [(44, None, 120, "contra"), (26, None, 120, "contra")]   # una por enemigo, con todas sus partidas
+    assert len(queries(8, [1, 2, 3, 4, 5], [6, 7, 9, 10])) == 5
+    assert queries(8, [], [5])[-1][3] == "generales"             # sin enemigos conocidos
+    two = Guide("a", 8, [], enemies=[44, 1], allies=[5])
+    one = Guide("b", 8, [], enemies=[26], allies=[])
+    assert coincidences(two, {44, 26}, {5}) == (1, 1)
+    assert similarity(two, {44, 26}, {5}) > similarity(one, {44, 26}, {5})
+    # tu rival de línea pesa más: una guía contra él gana a otra contra un enemigo cualquiera
+    vs_lane, vs_other = Guide("c", 8, [], enemies=[26]), Guide("d", 8, [], enemies=[44])
+    assert similarity(vs_lane, {44, 26}, set(), weights={26: 1.5}) > similarity(vs_other, {44, 26}, set(),
+                                                                              weights={26: 1.5})

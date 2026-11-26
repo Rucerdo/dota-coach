@@ -18,8 +18,12 @@ LEVELS = {                 # nivel → (color de la franja, color del icono)
     "info": ("#4FC3F7", "#B3E5FC"),
 }
 WIDTH, GAP = 360, 8
+GAME_WIDTH = 300           # encima del juego, más estrechas: van en fila
+GAME_VISIBLE = 3           # como mucho 3 a la vez; las demás esperan su turno (cinta de sushi)
+STAGGER_MS = 900           # si llegan varias de golpe, entran (y por tanto salen) una detrás de otra
+MAX_AGE = 8.0              # segundos: un aviso que lleva más esperando (cola, panel ocupado) ya no se enseña
 PANEL_TOP, PANEL_RIGHT = 108, 18
-GAME_TOP = 88              # px por debajo del borde superior de Dota (a 1080 de alto): bajo los retratos y
+GAME_TOP = 100             # px por debajo del borde superior de Dota (a 1080 de alto): bajo los retratos y
                            # los rótulos de definitivas (ui/ultbadges.py, hasta 83)
 SHOW_MS, MAX_TOASTS = 6500, 3
 STEP_MS, STEPS = 16, 14
@@ -48,6 +52,7 @@ def _click_through(win: tk.Toplevel):
 class Toast:
     def __init__(self, manager: "ToastManager", title: str, text: str, level: str, icon: str, over_game: bool):
         self.manager, self.closing, self.over_game = manager, False, over_game
+        self.width = GAME_WIDTH if over_game else WIDTH
         bar, icon_color = LEVELS.get(level, LEVELS["info"])
         self.win = tk.Toplevel(manager.root)
         self.win.title("Dota Coach · aviso")  # que nunca se confunda con la ventana "Dota 2" al buscarla
@@ -60,7 +65,7 @@ class Toast:
         except tk.TclError:
             pass
         card = ctk.CTkFrame(self.win, fg_color="#161D28", bg_color=KEY, corner_radius=14, border_width=1,
-                            border_color=bar, width=WIDTH, height=10)  # alto: el del contenido
+                            border_color=bar, width=self.width, height=10)  # alto: el del contenido
         card.pack(fill="both", expand=True)
         card.grid_columnconfigure(2, weight=1)
         ctk.CTkFrame(card, fg_color=bar, width=5, height=10, corner_radius=3).grid(
@@ -70,7 +75,7 @@ class Toast:
         ctk.CTkLabel(card, text=title, font=_font(14, "bold"), text_color="#F4F6F9", anchor="w").grid(
             row=0, column=2, sticky="sw", padx=(2, 14), pady=(10, 0))
         ctk.CTkLabel(card, text=text, font=_font(12), text_color="#C3CCD6", anchor="w", justify="left",
-                     wraplength=WIDTH - 90).grid(row=1, column=2, sticky="nw", padx=(2, 14), pady=(0, 10))
+                     wraplength=self.width - 90).grid(row=1, column=2, sticky="nw", padx=(2, 14), pady=(0, 10))
         if over_game:
             self.win.update_idletasks()
             _click_through(self.win)
@@ -83,15 +88,15 @@ class Toast:
 
     # ---------- animación ----------
     def slide_in(self, x: int, y: int):
-        """Sobre el juego baja desde arriba; sobre el panel entra desde la derecha."""
+        """Entra desde la derecha (encima del juego, como en una cinta: las demás se corren a la izquierda)."""
         self.x, self.y = x, y
-        sx, sy = (x, y - 24) if self.over_game else (x + 60, y)
+        sx, sy = x + 60, y
 
         def step(i=0):
             if self.closing or not self.win.winfo_exists():
                 return
             ease = 1 - (1 - i / STEPS) ** 3
-            self.win.geometry(f"{WIDTH}x{self.height}+{int(sx + (x - sx) * ease)}+{int(sy + (y - sy) * ease)}")
+            self.win.geometry(f"{self.width}x{self.height}+{int(sx + (x - sx) * ease)}+{int(sy + (y - sy) * ease)}")
             self._alpha(0.96 * ease)
             if i < STEPS:
                 self.win.after(STEP_MS, step, i + 1)
@@ -99,16 +104,29 @@ class Toast:
         self.win.after(SHOW_MS, self.close)
 
     def move_to(self, x: int, y: int):
-        start_y = self.y
+        start_x, start_y = self.x, self.y
 
         def step(i=0):
             if not self.win.winfo_exists():
                 return
-            self.y = int(start_y + (y - start_y) * (1 - (1 - i / STEPS) ** 3))
-            self.win.geometry(f"{WIDTH}x{self.height}+{x}+{self.y}")
+            ease = 1 - (1 - i / STEPS) ** 3
+            self.x = int(start_x + (x - start_x) * ease)
+            self.y = int(start_y + (y - start_y) * ease)
+            self.win.geometry(f"{self.width}x{self.height}+{self.x}+{self.y}")
             if i < STEPS:
                 self.win.after(STEP_MS, step, i + 1)
         step()
+
+    def slide_out_left(self):
+        """Sale por la izquierda mientras se desvanece."""
+        start_x = self.x
+
+        def step(i=0):
+            if self.win.winfo_exists() and i <= STEPS:
+                self.win.geometry(f"{self.width}x{self.height}+{int(start_x - 60 * i / STEPS)}+{self.y}")
+                self.win.after(STEP_MS, step, i + 1)
+        step()
+        self.close()
 
     def close(self):
         if self.closing:
@@ -134,43 +152,115 @@ class Toast:
 
 
 class ToastManager:
+    """Encima del juego: una fila centrada bajo los retratos, como mucho GAME_VISIBLE a la vez. La nueva entra por la
+    derecha, las demás se corren a la izquierda y, si llegan muchas de golpe, esperan su turno en una cola (como una
+    cinta de sushi) en vez de llenar la pantalla. En el panel: apiladas en la esquina, como siempre."""
+
     def __init__(self, root: tk.Misc, placement: str = "game"):
         self.root, self.placement, self.toasts = root, placement, []
+        self.queue: list[tuple] = []
+        self.last_entry = 0.0
+        self.pumping = False
 
-    def _game_anchor(self) -> tuple[int, int] | None:
+    def _game_client(self):
         try:
             from ..vision.topbar import dota_client_rect
-            client = dota_client_rect()
+            return dota_client_rect()
         except Exception:
-            client = None
-        if not client:
             return None
-        x0, y0, w, h = client
-        return int(x0 + w / 2 - WIDTH / 2), int(y0 + GAME_TOP * h / 1080)
 
-    def _anchor(self) -> tuple[tuple[int, int], bool]:
-        """(x, y) de la primera notificación y si va encima del juego."""
-        if self.placement == "game":
-            spot = self._game_anchor()
-            if spot:
-                return spot, True
-        x = self.root.winfo_rootx() + self.root.winfo_width() - WIDTH - PANEL_RIGHT
-        return (x, self.root.winfo_rooty() + PANEL_TOP), False
+    def _active(self) -> list[Toast]:
+        return [t for t in self.toasts if not t.closing]
 
-    def show(self, title: str, text: str, level: str = "info", icon: str = "●"):
-        while len([t for t in self.toasts if not t.closing]) >= MAX_TOASTS:
-            next(t for t in self.toasts if not t.closing).close()
-        (x, y), over_game = self._anchor()
+    def _over_game(self) -> bool:
+        return self.placement == "game" and self._game_client() is not None
+
+    def show(self, title: str, text: str, level: str = "info", icon: str = "●", created: float | None = None):
+        import time
+        created = time.time() if created is None else created
+        if time.time() - created > MAX_AGE:
+            return  # p. ej. "te vienen a gankear" de hace 15 s: ya no tiene sentido
+        over_game = self._over_game()
+        if over_game:
+            import time
+            wait = STAGGER_MS / 1000 - (time.time() - self.last_entry)
+            if len(self._active()) >= GAME_VISIBLE or wait > 0 or self.queue:
+                self.queue.append((title, text, level, icon, created))
+                self._pump_later(max(wait, 0))
+                return
+            self.last_entry = time.time()
+        else:
+            while len(self._active()) >= MAX_TOASTS:
+                self._active()[0].close()
         toast = Toast(self, title, text, level, icon, over_game)
-        offset = sum(t.height + GAP for t in self.toasts if not t.closing)
         self.toasts.append(toast)
-        toast.slide_in(x, y + offset)
+        self._layout(new=toast)
+
+    def _row_positions(self, toasts: list[Toast]) -> list[tuple[int, int]]:
+        client = self._game_client()
+        if not client:
+            return []
+        x0, y0, w, h = client
+        total = sum(t.width for t in toasts) + GAP * (len(toasts) - 1)
+        x, y = int(x0 + w / 2 - total / 2), int(y0 + GAME_TOP * h / 1080)
+        out = []
+        for t in toasts:
+            out.append((x, y))
+            x += t.width + GAP
+        return out
+
+    def _layout(self, new: Toast | None = None):
+        active = self._active()
+        if active and active[0].over_game:
+            spots = self._row_positions(active)
+            if spots:
+                for t, (x, y) in zip(active, spots):
+                    if t is new:
+                        t.slide_in(x, y)
+                    else:
+                        t.move_to(x, y)
+                return
+        x = self.root.winfo_rootx() + self.root.winfo_width() - WIDTH - PANEL_RIGHT
+        y = self.root.winfo_rooty() + PANEL_TOP
+        for t in active:
+            if t is new:
+                t.slide_in(x, y)
+            else:
+                t.move_to(x, y)
+            y += t.height + GAP
+
+    def _pump_later(self, seconds: float):
+        if not self.pumping:
+            self.pumping = True
+            self.root.after(int(seconds * 1000) + 30, self._pump)
+
+    def _pump(self):
+        """Saca la siguiente de la cola en cuanto hay sitio (y ha pasado el intervalo desde la anterior)."""
+        import time
+        self.pumping = False
+        self.queue = [q for q in self.queue if time.time() - q[4] <= MAX_AGE]   # los caducados se tiran
+        if not self.queue:
+            return
+        if not self._over_game():
+            while self.queue:
+                t = self.queue.pop(0)
+                self.placement, saved = "panel", self.placement
+                self.show(*t)
+                self.placement = saved
+            return
+        wait = STAGGER_MS / 1000 - (time.time() - self.last_entry)
+        if len(self._active()) < GAME_VISIBLE and wait <= 0:
+            title, text, level, icon, _created = self.queue.pop(0)
+            self.last_entry = time.time()
+            toast = Toast(self, title, text, level, icon, True)
+            self.toasts.append(toast)
+            self._layout(new=toast)
+        if self.queue:
+            self._pump_later(max(wait, 0.25))
 
     def removed(self, toast: Toast):
         if toast in self.toasts:
             self.toasts.remove(toast)
-        (x, y), _ = self._anchor()
-        for t in self.toasts:
-            if not t.closing:
-                t.move_to(x, y)
-                y += t.height + GAP
+        self._layout()
+        if self.queue:
+            self._pump_later(0)

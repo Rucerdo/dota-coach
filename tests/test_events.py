@@ -38,3 +38,24 @@ def test_kills_streaks_and_purchases(gd):
     assert k.killer.loc == "Phantom Assassin" and k.victim.loc == "Juggernaut" and k.killer_enemy
     assert w.state.purchases == [(310, "Lion", "Ghost Scepter")]
     assert w.update(_st(312, events=ev), heroes) == [] and len(w.state.kills) == 1   # sin duplicados
+
+
+def test_my_kills_come_from_kill_list(gd):
+    from coach.engine.events import EventWatch
+    from coach.gsi import parse_state
+    w = EventWatch(gd)
+    me, lion, pa = gd.hero("jugg"), gd.hero("lion"), gd.hero("pa")
+    heroes = {0: me, 5: lion, 7: pa}
+
+    def st(clock, kill_list):
+        return parse_state({"map": {"clock_time": clock, "game_state": "DOTA_GAMERULES_STATE_GAME_IN_PROGRESS"},
+                            "player": {"team_name": "radiant", "team_slot": 0, "kill_list": kill_list}})
+    w.update(st(100, {}), heroes)
+    w.update(st(200, {"victimid_5": 1}), heroes)
+    w.update(st(260, {"victimid_5": 1, "victimid_7": 2}), heroes)    # dos a PA de golpe
+    kills = w.state.kills
+    assert [(k.clock, k.killer.loc, k.victim.loc, k.killer_enemy) for k in kills] == [
+        (200, "Juggernaut", "Lion", False), (260, "Juggernaut", "Phantom Assassin", False),
+        (260, "Juggernaut", "Phantom Assassin", False)]
+    w.update(st(300, {"victimid_5": 1, "victimid_7": 2}), heroes)    # sin cambios: nada nuevo
+    assert len(w.state.kills) == 3

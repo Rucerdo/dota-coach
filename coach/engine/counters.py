@@ -203,11 +203,34 @@ def item_role(hero: Hero | None, configured: str = "auto") -> str:
     return "carry" if role == "core" and hero and hero.loc in HARD_CARRIES else role
 
 
-def enemy_traits(enemies: list[Hero]) -> dict[str, list[str]]:
-    """rasgo → héroes enemigos que lo tienen."""
+# Lo que un enemigo LLEVA (visto al seleccionarlo, vision/inventory.py) también pide counters
+ITEM_TRAITS = {
+    "item_butterfly": "evasion", "item_talisman_of_evasion": "evasion", "item_heavens_halberd": "evasion",
+    "item_ghost": "buffs", "item_glimmer_cape": "buffs", "item_ethereal_blade": "buffs", "item_aeon_disk": "buffs",
+    "item_manta": "illusions", "item_illusionsts_cape": "illusions",
+    "item_satanic": "heal", "item_heart": "heal", "item_holy_locket": "heal", "item_mekansm": "heal",
+    "item_guardian_greaves": "heal",
+    "item_blink": "escape", "item_overwhelming_blink": "escape", "item_swift_blink": "escape",
+    "item_arcane_blink": "escape", "item_force_staff": "escape", "item_hurricane_pike": "escape",
+    "item_desolator": "physical_burst", "item_greater_crit": "physical_burst", "item_bloodthorn": "physical_burst",
+    "item_dagon": "magic_burst", "item_dagon_2": "magic_burst", "item_dagon_3": "magic_burst",
+    "item_dagon_4": "magic_burst", "item_dagon_5": "magic_burst", "item_kaya_and_sange": "magic_burst",
+    "item_invis_sword": "invis", "item_silver_edge": "invis",
+    "item_sheepstick": "disables", "item_abyssal_blade": "disables", "item_rod_of_atos": "disables",
+    "item_gungir": "disables",
+}
+
+
+def enemy_traits(enemies: list[Hero], enemy_items: dict[int, list[str]] | None = None) -> dict[str, list[str]]:
+    """rasgo → héroes enemigos que lo tienen (por el héroe y por los objetos que se le han visto)."""
     out: dict[str, list[str]] = {}
     for h in enemies:
-        for t in TRAITS.get(h.loc, []):
+        traits = list(TRAITS.get(h.loc, []))
+        for item in (enemy_items or {}).get(h.id, []):
+            t = ITEM_TRAITS.get(item)
+            if t and t not in traits:
+                traits.append(t)
+        for t in traits:
             out.setdefault(t, []).append(h.loc)
     return out
 
@@ -240,7 +263,8 @@ def native_phase(gd: GameData, name: str, popularity: dict | None = None) -> str
 def suggest_items(gd: GameData, my_hero: Hero | None, enemies: list[Hero], owned: list[str] = (),
                   role: str = "auto", meta=None, popularity: dict | None = None, limit: int = 6,
                   phase: str | None = None, standard: dict[str, tuple[float, str]] | None = None,
-                  strict: bool = False, turbo: bool = False) -> list[ItemSuggestion]:
+                  strict: bool = False, turbo: bool = False,
+                  enemy_items: dict[int, list[str]] | None = None) -> list[ItemSuggestion]:
     """phase: start | early | mid | late (o None para toda la partida). strict: solo los objetos de ESA fase
     (native_phase), para que la build por fases no repita objetos ni meta los caros al principio.
     standard: {item_*: (fracción 0-1, texto)} de partidas parecidas (lo que llevaban los que ganaron)."""
@@ -258,7 +282,7 @@ def suggest_items(gd: GameData, my_hero: Hero | None, enemies: list[Hero], owned
         s.priority += weight
         s.reasons.append(reason)
 
-    for trait, heroes in enemy_traits(enemies).items():
+    for trait, heroes in enemy_traits(enemies, enemy_items).items():
         for name, kind, why in COUNTER_ITEMS.get(trait, []):
             if kind not in allowed:
                 continue
@@ -380,13 +404,15 @@ def purchase_order(sugg: list[ItemSuggestion]) -> list[ItemSuggestion]:
 
 
 def counters_for(gd: GameData, enemy: Hero, my_hero: Hero | None = None, role: str = "auto",
-                 owned: list[str] = (), limit: int = 3) -> list[tuple[str, str]]:
+                 owned: list[str] = (), limit: int = 3, items: list[str] = ()) -> list[tuple[str, str]]:
     """Los objetos que mejor counterean a UN enemigo para tu rol: [(item_*, motivo)], los ya comprados fuera."""
     allowed = ROLE_ITEMS[item_role(my_hero, role)]
     owned = [o for o in owned if o]
     closure = owned_closure(gd, owned)
     best: dict[str, tuple[float, str]] = {}
-    for trait in TRAITS.get(enemy.loc, []):
+    traits = list(TRAITS.get(enemy.loc, []))
+    traits += [ITEM_TRAITS[i] for i in items if ITEM_TRAITS.get(i) and ITEM_TRAITS[i] not in traits]
+    for trait in traits:
         for name, kind, why in COUNTER_ITEMS.get(trait, []):
             if kind not in allowed or not gd.item(name) or excluded_by_inventory(gd, name, owned, closure):
                 continue

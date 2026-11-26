@@ -4,3 +4,10 @@ pillow>=10.0
 numpy>=1.26
 comtypes>=1.4
 customtkinter>=5.2
+# OCR de Windows (nombre del héroe seleccionado): PyWinRT oficial
+winrt-Windows.Media.Ocr>=3.0
+winrt-Windows.Graphics.Imaging>=3.0
+winrt-Windows.Storage.Streams>=3.0
+winrt-Windows.Globalization>=3.0
+winrt-Windows.Foundation>=3.0
+winrt-Windows.Foundation.Collections>=3.0

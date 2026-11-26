@@ -29,6 +29,9 @@ class Notice:
     toast: bool = True     # merece notificación flotante
 
 
+MAX_KILLS = 300   # todas las de la partida
+
+
 @dataclass
 class Kill:
     clock: int
@@ -71,6 +74,7 @@ class EventWatch:
         self.lost: set[str] = set()
         self.cooldown: dict[str, int] = {}
         self.state = EventsState()
+        self.my_kills: dict[int, int] | None = None   # último kill_list visto (None = aún ninguno)
 
     def _hero(self, pid, heroes: dict[int, Hero]) -> Hero | None:
         try:
@@ -82,7 +86,23 @@ class EventWatch:
         out: list[Notice] = []
         out += self._buildings(st)
         out += self._events(st, heroes_by_pid)
+        self._my_kills(st, heroes_by_pid)
         return out
+
+    def _my_kills(self, st: GameState, heroes: dict[int, Hero]):
+        """Tus asesinatos (de kill_list: Dota no manda el aviso de chat cuando matas tú)."""
+        prev = self.my_kills or {}
+        me = heroes.get(st.player_id) if st.player_id is not None else None
+        new = []
+        for pid, n in st.kill_list.items():
+            for _ in range(max(0, n - prev.get(pid, 0))):
+                victim = heroes.get(pid)
+                new.append(Kill(st.clock, me, victim, False))
+                if victim:
+                    self.state.streaks.pop(victim.loc, None)
+        self.my_kills = dict(st.kill_list)
+        if new:
+            self.state.kills = (self.state.kills + new)[-MAX_KILLS:]
 
     # ---------- torres ----------
     def _buildings(self, st: GameState) -> list[Notice]:
@@ -126,7 +146,9 @@ class EventWatch:
             if etype == "CHAT_MESSAGE_HERO_KILL":
                 killer, victim = self._hero(p1, heroes), self._hero(p2, heroes)
                 enemy = None if mine is None or p1 is None or int(p1) < 0 else int(p1) not in mine
-                self.state.kills = (self.state.kills + [Kill(clock, killer, victim, enemy)])[-12:]
+                if p1 is not None and st.player_id is not None and int(p1) == st.player_id:
+                    continue  # tus asesinatos ya salen de kill_list (por si Dota también los avisa)
+                self.state.kills = (self.state.kills + [Kill(clock, killer, victim, enemy)])[-MAX_KILLS:]
                 if victim:
                     self.state.streaks.pop(victim.loc, None)
             elif etype == "CHAT_MESSAGE_STREAK_KILL":

@@ -28,6 +28,11 @@ TP_DISTANCE = 4500
 TP_WINDOW = 6                 # segundos entre la última vez que se vio y la nueva aparición
 COOLDOWN = 30
 QUIET_START = 60              # el primer minuto (y mientras estés en tu base) no hay avisos de enemigos cerca
+# Pelea en equipo: 3+ enemigos y 3+ de los tuyos (contándote) a menos de FIGHT_DISTANCE, o 2+ muertes en
+# FIGHT_KILLS_WINDOW s. Mientras dure (y FIGHT_HOLD s después) no hay avisos de gank, TP ni desaparecidos: ya lo ves.
+FIGHT_DISTANCE = 3000
+FIGHT_KILLS_WINDOW = 15
+FIGHT_HOLD = 20
 
 
 def zone(x: int, y: int) -> str:
@@ -70,6 +75,8 @@ class MapWatch:
         self.dead: dict[str, int] = {}      # enemigos muertos (hasta que se les vuelve a ver)
         self.multi: set[str] = set()        # héroes con clon/ilusiones (su posición no sirve para TPs)
         self.tp_pending: dict[str, tuple[int, int, int]] = {}   # salto visto una vez: se confirma en la siguiente
+        self.fight_until = -1                # reloj hasta el que se considera que hay pelea en equipo
+        self.kills_seen: list[int] = []      # relojes de las muertes recientes (de cualquiera)
         self.me = ""
 
     # ---------- reparto de líneas ----------
@@ -109,6 +116,15 @@ class MapWatch:
     def mark_dead(self, unit: str, clock: int):
         """Un enemigo ha muerto (aviso de muerte de GSI): mientras no reaparezca no está "desaparecido"."""
         self.dead[unit] = clock
+
+    def note_kill(self, clock: int):
+        """Ha muerto alguien (de cualquier bando): varias muertes seguidas = pelea en equipo."""
+        self.kills_seen = [c for c in self.kills_seen if clock - c <= FIGHT_KILLS_WINDOW] + [clock]
+        if len(self.kills_seen) >= 2:
+            self.fight_until = max(self.fight_until, clock + FIGHT_HOLD)
+
+    def in_fight(self, clock: int) -> bool:
+        return clock <= self.fight_until
 
     def update(self, st: GameState) -> list[Alert]:
         if not st.in_game or not st.units:
@@ -151,6 +167,15 @@ class MapWatch:
             self.last_seen[name] = (clock, u.x, u.y)
             self.mia_warned.discard(name)
 
+        if me is not None:
+            foes = {n for n, units in by_name.items() if units[0].enemy
+                    and any(math.hypot(x.x - me.x, x.y - me.y) < FIGHT_DISTANCE for x in units)}
+            mates = {n for n, units in by_name.items() if not units[0].enemy
+                     and any(math.hypot(x.x - me.x, x.y - me.y) < FIGHT_DISTANCE for x in units)}
+            if len(foes) >= 3 and len(mates) >= 3:
+                self.fight_until = max(self.fight_until, clock + FIGHT_HOLD)
+        if self.in_fight(clock):
+            return []  # pelea en equipo: ni ganks, ni TPs, ni desaparecidos (lo estás viendo)
         if me is None or not st.alive or clock < QUIET_START or zone(me.x, me.y) == "base":
             return alerts  # al salir de la fuente todos están juntos: no es un gank
         my_lane = self.my_lane()

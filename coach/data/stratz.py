@@ -209,10 +209,11 @@ MATCH_BATCH = 10   # STRATZ no deja pedir más partidas de golpe (y matches(ids)
 
 
 def hero_builds(hero_id: int, against: int | None = None, with_hero: int | None = None, take: int = 30,
-                ttl: float = 86400) -> list[dict]:
+                ttl: float = 86400, on_batch=None) -> list[dict]:
     """Builds reales de tu héroe: [{match, win, minutes, position, enemies, allies, purchases: [[item_id, minuto]]}].
-    Con 'against'/'with_hero', solo partidas contra/con ese héroe. Se guardan un día (y se borran con cada parche)."""
-    name = f"stratz_builds_{hero_id}_{against or 0}_{with_hero or 0}"
+    Con 'against'/'with_hero', solo partidas contra/con ese héroe. Se guardan un día (y se borran con cada parche).
+    STRATZ tiene unas 80-110 partidas por héroe contra un enemigo concreto. on_batch(hechas, total) da el avance."""
+    name = f"stratz_builds_{hero_id}_{against or 0}_{with_hero or 0}_{take}"   # con 'take': una pequeña no vale por una grande
     hit = read_cached(name)
     import time
     if hit and time.time() - hit[0] < ttl:
@@ -222,6 +223,8 @@ def hero_builds(hero_id: int, against: int | None = None, with_hero: int | None 
         lists = (data.get("heroStats") or {}).get("guide") or []
         ids = [g["matchId"] for gl in lists for g in (gl.get("guides") or []) if g.get("matchId")][:take]
         out = []
+        if on_batch:
+            on_batch(0, len(ids))
         for i in range(0, len(ids), MATCH_BATCH):
             body = " ".join(f"m{j}: match(id: {int(mid)}) {{ {MATCH_FIELDS} }}"
                             for j, mid in enumerate(ids[i:i + MATCH_BATCH]))
@@ -229,6 +232,8 @@ def hero_builds(hero_id: int, against: int | None = None, with_hero: int | None 
                 row = _build_row(m, hero_id)
                 if row:
                     out.append(row)
+            if on_batch:
+                on_batch(min(i + MATCH_BATCH, len(ids)), len(ids))
     except StratzError:
         if hit:
             return hit[1]

@@ -70,6 +70,7 @@ class GameState:
     xpm: int = 0
     net_worth: int = 0
     player_id: int | None = None  # 0-4 Radiant, 5-9 Dire (mismo orden que la barra superior)
+    kill_list: dict[int, int] = field(default_factory=dict)   # player_id de tus víctimas → veces que lo has matado
     radiant_score: int = 0
     dire_score: int = 0
     buildings: dict[str, tuple[int, int]] = field(default_factory=dict)  # TU bando: nombre → (vida, máxima)
@@ -144,6 +145,10 @@ def parse_state(payload: dict) -> GameState:
     st.income_gold = _int(p.get("gold_from_income"))
     st.turbo = is_turbo(st.clock, st.income_gold)
     st.kills, st.deaths, st.assists = _int(p.get("kills")), _int(p.get("deaths")), _int(p.get("assists"))
+    # Dota no manda el aviso de chat cuando matas tú: tus víctimas salen de kill_list ("victimid_7": 2)
+    for key, n in (p.get("kill_list") or {}).items():
+        if str(key).startswith("victimid_") and str(key)[9:].isdigit():
+            st.kill_list[int(str(key)[9:])] = _int(n)
     st.last_hits = _int(p.get("last_hits"))
     st.hero, st.hero_id = str(h.get("name") or ""), _int(h.get("id"))
     st.level = _int(h.get("level"))

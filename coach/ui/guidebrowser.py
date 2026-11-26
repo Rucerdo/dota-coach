@@ -10,7 +10,9 @@ from typing import Callable
 
 import customtkinter as ctk
 
-from ..engine.guides import Guide, rank, similarity
+import time
+
+from ..engine.guides import Guide, coincidences, rank, similarity
 
 BG, CARD, CARD2 = "#14181F", "#1C222C", "#252D39"
 TEXT, MUTED, ACCENT, GREEN, GOLD = "#E8ECF1", "#8D97A5", "#E5534B", "#5FD17A", "#E6B450"
@@ -24,10 +26,11 @@ def _font(size, weight="normal"):
 class GuideBrowser(ctk.CTkToplevel):
     def __init__(self, master, gd, images, fetch: Callable[[int], list[Guide]],
                  choose: Callable[[Guide | None], None], current: Callable[[], Guide | None],
-                 context: Callable[[], tuple[int | None, set[int], set[int], str]]):
+                 context: Callable[[], tuple[int | None, set[int], set[int], str]], shop: dict | None = None):
         """fetch(hero_id) → guías (puede tardar: va en otro hilo). context() → (tu héroe, enemigos, aliados,
         posición) para ordenar por parecido."""
         super().__init__(master, fg_color=BG)
+        self.shop = shop or {}
         self.gd, self.images, self.fetch, self._choose, self.current, self.context = \
             gd, images, fetch, choose, current, context
         self.title("Dota Coach · Guías")
@@ -37,7 +40,7 @@ class GuideBrowser(ctk.CTkToplevel):
         self.guides: list[Guide] = []
         self.hero_id: int | None = None
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(2, weight=1)
+        self.grid_rowconfigure(3, weight=1)
 
         top = ctk.CTkFrame(self, fg_color=CARD, corner_radius=10)
         top.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 6))
@@ -55,6 +58,14 @@ class GuideBrowser(ctk.CTkToplevel):
         self.mode.pack(side="left", padx=8)
         self.status = ctk.CTkLabel(top, text="", font=_font(11), text_color=MUTED)
         self.status.pack(side="right", padx=12)
+        # progreso de la búsqueda (con lo que se va pidiendo)
+        self.prog = ctk.CTkFrame(self, fg_color=CARD, corner_radius=10)
+        self.prog.grid_columnconfigure(0, weight=1)
+        self.prog_bar = ctk.CTkProgressBar(self.prog, height=10, progress_color=GREEN, fg_color=CARD2)
+        self.prog_bar.grid(row=0, column=0, sticky="ew", padx=12, pady=(10, 4))
+        self.prog_text = ctk.CTkLabel(self.prog, text="", font=_font(11), text_color=MUTED, anchor="w")
+        self.prog_text.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 8))
+        self.last_partial = 0.0
 
         cur = ctk.CTkFrame(self, fg_color=CARD, corner_radius=10)
         cur.grid(row=1, column=0, sticky="ew", padx=12, pady=6)
@@ -64,9 +75,23 @@ class GuideBrowser(ctk.CTkToplevel):
         self.clear_btn = ctk.CTkButton(cur, text="Quitar guía", width=110, fg_color=CARD2, hover_color="#323C4B",
                                        command=lambda: self.choose(None))
         self.clear_btn.grid(row=0, column=1, padx=12, pady=8)
+        # tienda de Dota: sustituir la guía por defecto del héroe por la elegida (y poder deshacerlo)
+        shop_row = ctk.CTkFrame(cur, fg_color="transparent")
+        shop_row.grid(row=1, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 8))
+        self.shop_btn = ctk.CTkButton(shop_row, text="Sustituir la guía por defecto de Dota", width=250,
+                                      fg_color=GREEN, text_color="#0E1116", hover_color="#3B8F50",
+                                      command=self._shop_export)
+        self.shop_btn.pack(side="left")
+        self.restore_btn = ctk.CTkButton(shop_row, text="Restaurar la guía de Valve", width=190, fg_color=CARD2,
+                                         hover_color="#323C4B", command=self._shop_restore)
+        self.restore_btn.pack(side="left", padx=8)
+        self.shop_label = ctk.CTkLabel(shop_row, text="", font=_font(11), text_color=MUTED, anchor="w",
+                                       justify="left", wraplength=420)
+        self.shop_label.pack(side="left", padx=8)
+        self.shop_busy = False
 
         self.list = ctk.CTkScrollableFrame(self, fg_color=BG)
-        self.list.grid(row=2, column=0, sticky="nsew", padx=12, pady=(6, 12))
+        self.list.grid(row=3, column=0, sticky="nsew", padx=12, pady=(6, 12))
         self.list.grid_columnconfigure(0, weight=1)
         self.rows: list[ctk.CTkFrame] = []
 
@@ -110,10 +135,16 @@ class GuideBrowser(ctk.CTkToplevel):
         self.guides = []
         self.render()
         self.status.configure(text=f"Buscando guías de {hero.loc}…")
+        self.prog.grid(row=2, column=0, sticky="ew", padx=12, pady=6)
+        self.prog_bar.set(0)
+        self.prog_text.configure(text="Preparando la búsqueda…")
+
+        def progress(done, total, text, partial):
+            self.q.put(("progress", (hero.id, done, total, text, partial), None))
 
         def job():
             try:
-                self.q.put((hero.id, self.fetch(hero.id), None))
+                self.q.put((hero.id, self.fetch(hero.id, progress), None))
             except Exception as ex:
                 self.q.put((hero.id, [], ex))
         threading.Thread(target=job, daemon=True).start()
@@ -122,9 +153,31 @@ class GuideBrowser(ctk.CTkToplevel):
         try:
             while True:
                 hero_id, guides, err = self.q.get_nowait()
+                if hero_id == "progress":
+                    hid, done, total, text, partial = guides
+                    if hid != self.hero_id:
+                        continue
+                    self.prog_bar.set(done / total if total else 0)
+                    if partial is not None:
+                        self.partial_count = len(partial)
+                    self.prog_text.configure(text=f"{done}/{total} partidas · {text} · "
+                                                  f"{getattr(self, 'partial_count', 0)} guías")
+                    # resultados según llegan (sin repintar a cada paso: como mucho cada 1.5 s)
+                    if partial and time.time() - self.last_partial > 1.5:
+                        self.last_partial = time.time()
+                        self.guides = partial
+                        self.render()
+                    continue
+                if hero_id == "shop":
+                    self.shop_busy = False
+                    self._update_shop()
+                    self.shop_label.configure(text=f"No se pudo: {err}" if err else guides,
+                                              text_color="#E5534B" if err else GREEN)
+                    continue
                 if hero_id != self.hero_id:
                     continue  # respuesta de una búsqueda anterior
                 self.guides = guides
+                self.prog.grid_remove()
                 name = self.gd.heroes[hero_id].loc
                 self.status.configure(text=f"No se pudieron cargar ({err})" if err else
                                       f"{len(guides)} guías de {name} (partidas ganadas · STRATZ)")
@@ -136,6 +189,7 @@ class GuideBrowser(ctk.CTkToplevel):
 
     # ---------- pintar ----------
     def _update_current(self):
+        self._update_shop()
         g = self.current()
         if g is None:
             self.cur_label.configure(text="Sin guía: la build se arma con las estadísticas, tus enemigos y las "
@@ -154,20 +208,84 @@ class GuideBrowser(ctk.CTkToplevel):
         self._update_current()
         self.render()
 
+    # ---------- tienda de Dota ----------
+    def _shop_hero(self) -> int | None:
+        g = self.current()
+        return g.hero_id if g else self.hero_id
+
+    def _update_shop(self):
+        if not self.shop:
+            self.shop_btn.configure(state="disabled", fg_color=CARD2, text_color=MUTED)
+            self.restore_btn.configure(state="disabled")
+            self.shop_label.configure(text="")
+            return
+        hero_id = self._shop_hero()
+        hero = self.gd.heroes.get(hero_id) if hero_id else None
+        try:
+            ours, gid = self.shop["status"](hero_id) if hero else (False, None)
+        except Exception:
+            ours, gid = False, None
+        g = self.current()
+        same = ours and g is not None and gid == g.id
+        if self.shop_busy:
+            return
+        can = g is not None and not same
+        self.shop_btn.configure(state="normal" if can else "disabled",
+                                fg_color=GREEN if can else CARD2, text_color="#0E1116" if can else MUTED,
+                                text="✓ Guía ya en la tienda de Dota" if same else
+                                "Actualizar la guía de Dota" if ours else "Sustituir la guía por defecto de Dota")
+        self.restore_btn.configure(state="normal" if ours else "disabled")
+        name = hero.loc if hero else "este héroe"
+        if same:
+            text = f"En la tienda de Dota ya está esta guía para {name} (objetos, habilidades y talentos)."
+        elif ours:
+            text = f"La tienda de Dota tiene otra guía del coach para {name}."
+        else:
+            text = f"La tienda de Dota tiene la guía de Valve para {name}."
+        self.shop_label.configure(text=text)
+
+    def _shop_run(self, job, done_text):
+        self.shop_busy = True
+        self.shop_btn.configure(state="disabled")
+        self.restore_btn.configure(state="disabled")
+        self.shop_label.configure(text="Escribiendo…")
+
+        def run():
+            try:
+                job()
+                self.q.put(("shop", done_text, None))
+            except Exception as ex:
+                self.q.put(("shop", None, ex))
+        threading.Thread(target=run, daemon=True).start()
+
+    def _shop_export(self):
+        g = self.current()
+        if g is not None:
+            self._shop_run(lambda: self.shop["export"](g), "Hecho. Dota lee las guías al arrancar: la verás en la "
+                                                          "tienda cuando reinicies Dota.")
+
+    def _shop_restore(self):
+        hero_id = self._shop_hero()
+        if hero_id:
+            self._shop_run(lambda: self.shop["restore"](hero_id), "Restaurada la guía de Valve.")
+
     def render(self):
+        self._update_shop()
         for r in self.rows:
             r.destroy()
         self.rows = []
-        me, enemies, allies, position = self.context()
+        me, enemies, allies, position, *rest = self.context()
+        weights = rest[0] if rest else None
         guides = self.guides
         if self.hero_id == me and self.mode.get().startswith("Parecidas"):
-            guides = [g for g in rank(guides, enemies, allies, position)]
+            guides = [g for g in rank(guides, enemies, allies, position, weights)]
         else:
             guides = sorted(guides, key=lambda g: len(g.core), reverse=True)
         cur = self.current()
         for i, g in enumerate(guides[:MAX_ROWS]):
             self.rows.append(self._row(i, g, cur is not None and cur.id == g.id,
-                                       similarity(g, enemies, allies, position) if self.hero_id == me else 0,
+                                       similarity(g, enemies, allies, position, weights)
+                                       if self.hero_id == me else 0,
                                        enemies, allies))
 
     def _row(self, i: int, g: Guide, chosen: bool, sim: float, enemies: set[int], allies: set[int]):
@@ -192,9 +310,12 @@ class GuideBrowser(ctk.CTkToplevel):
                 lbl = ctk.CTkLabel(head, text="" if img else hero.loc[:2], image=img, width=34, height=19,
                                    fg_color=GREEN if hid in mark else CARD2, corner_radius=3)
                 lbl.pack(side="left", padx=1)
-        if sim >= 1:
-            ctk.CTkLabel(head, text="parecida a tu partida", font=_font(10, "bold"),
-                         text_color=GREEN).pack(side="left", padx=10)
+        e_in, a_in = coincidences(g, enemies, allies)
+        if e_in + a_in:
+            parts = [f"{e_in} enemigo{'s' if e_in != 1 else ''}" if e_in else "",
+                     f"{a_in} aliado{'s' if a_in != 1 else ''}" if a_in else ""]
+            ctk.CTkLabel(head, text=f"{e_in + a_in} en común ({' + '.join(p for p in parts if p)})",
+                         font=_font(10, "bold"), text_color=GREEN).pack(side="left", padx=10)
         strip = ctk.CTkFrame(f, fg_color="transparent")
         strip.grid(row=1, column=0, sticky="w", padx=10, pady=(2, 8))
         for j, (name, minute) in enumerate(g.core[:12]):
