@@ -94,6 +94,14 @@ ALTERNATIVES = [{"item_dust", "item_gem"}, {"item_orchid", "item_bloodthorn"}]
 # presupuesto (al empezar no tiene sentido sugerir una BKB).
 PHASES = ["start", "early", "mid", "late"]
 PHASE_LABELS = {"start": "Inicio", "early": "Early (0-12)", "mid": "Mid (12-28)", "late": "Late (28+)"}
+# Turbo: todo llega al doble de rápido (oro pasivo x2, partidas de la mitad). Las estadísticas (STRATZ/OpenDota) son
+# de partidas normales: se usan igual, pero el reloj de las fases y los minutos de referencia van a la mitad.
+TURBO_SPEED = 2.0
+TURBO_PHASE_LABELS = {"start": "Inicio", "early": "Early (0-6)", "mid": "Mid (6-14)", "late": "Late (14+)"}
+
+
+def phase_labels(turbo: bool = False) -> dict[str, str]:
+    return TURBO_PHASE_LABELS if turbo else PHASE_LABELS
 PHASE_BUDGET = {"start": 600, "early": 2500, "mid": 5500, "late": None}
 PHASE_MAX_COST = {"start": 1000}  # tope estricto solo al salir: en early los counters grandes son el objetivo
 PHASE_POPULARITY = {
@@ -145,8 +153,9 @@ def excluded_by_inventory(gd: GameData, name: str, owned, closure: set[str]) -> 
     return False
 
 
-def phase_for(clock_seconds: int) -> str:
-    minute = clock_seconds / 60
+def phase_for(clock_seconds: int, turbo: bool = False) -> str:
+    """Fase por el reloj de la partida (en turbo, el doble de rápido)."""
+    minute = clock_seconds / 60 * (TURBO_SPEED if turbo else 1)
     return "start" if minute < 0 else "early" if minute < 12 else "mid" if minute < 28 else "late"
 
 
@@ -163,6 +172,7 @@ class ItemSuggestion:
     reasons: list[str] = field(default_factory=list)
     patch_note: str = ""
     remaining: int | None = None    # lo que falta pagar descontando componentes que ya llevas
+    minute: float | None = None     # minuto medio en que se compra con tu héroe (partida normal), si se sabe
 
     @property
     def to_pay(self) -> int:
@@ -230,7 +240,7 @@ def native_phase(gd: GameData, name: str, popularity: dict | None = None) -> str
 def suggest_items(gd: GameData, my_hero: Hero | None, enemies: list[Hero], owned: list[str] = (),
                   role: str = "auto", meta=None, popularity: dict | None = None, limit: int = 6,
                   phase: str | None = None, standard: dict[str, tuple[float, str]] | None = None,
-                  strict: bool = False) -> list[ItemSuggestion]:
+                  strict: bool = False, turbo: bool = False) -> list[ItemSuggestion]:
     """phase: start | early | mid | late (o None para toda la partida). strict: solo los objetos de ESA fase
     (native_phase), para que la build por fases no repita objetos ni meta los caros al principio.
     standard: {item_*: (fracción 0-1, texto)} de partidas parecidas (lo que llevaban los que ganaron)."""
@@ -275,8 +285,9 @@ def suggest_items(gd: GameData, my_hero: Hero | None, enemies: list[Hero], owned
                     if detail and key == "start_game_items":
                         reason = f"lo compra al salir el {detail[0]:.0%} de los {who}{where}"
                     elif detail:
-                        reason = (f"lo compra el {detail[0]:.0%} de los {who}{where}, hacia el minuto "
-                                  f"{detail[1]:.0f} ({detail[2]:.0%} de victorias)")
+                        when = (f"hacia el minuto {detail[1] / TURBO_SPEED:.0f} en turbo" if turbo
+                                else f"hacia el minuto {detail[1]:.0f}")
+                        reason = f"lo compra el {detail[0]:.0%} de los {who}{where}, {when} ({detail[2]:.0%} de victorias)"
                     else:
                         reason = f"popular en {who}"
                     add(it.name, weight * POPULARITY_WEIGHT * n / total, reason)
@@ -320,9 +331,22 @@ def suggest_items(gd: GameData, my_hero: Hero | None, enemies: list[Hero], owned
                 review = meta.item_reviews.get(s.loc.lower()) if hasattr(meta, "item_reviews") else None
                 s.patch_note = (review or {}).get("summary") or "; ".join(c.text for c in changes[:2])
 
+    details = (popularity or {}).get("_details") or {}
+    for s in sugg.values():
+        item = gd.item(s.item)
+        d = details.get(str(item.id)) if item else None
+        if d:
+            s.minute = float(d[1])
+
     if strict and phase:
         sugg = {k: s for k, s in sugg.items()
                 if k in ALWAYS_NEEDED or native_phase(gd, k, popularity) == phase}
+    if phase in ("mid", "late"):
+        # componentes sueltos (Perseverance, Broadsword...): a estas alturas solo sirven para fabricar otra cosa,
+        # vengan de la popularidad, de partidas parecidas o de donde sea
+        comps = getattr(gd, "component_names", ())
+        sugg = {k: s for k, s in sugg.items() if k in STANDALONE or k in ALWAYS_NEEDED or k not in comps
+                or (gd.item(k) and gd.item(k).components)}
     cap = PHASE_MAX_COST.get(phase)
     if cap:
         sugg = {k: s for k, s in sugg.items() if s.to_pay <= cap}
@@ -341,6 +365,18 @@ def suggest_items(gd: GameData, my_hero: Hero | None, enemies: list[Hero], owned
             used_groups.add(group)
         out.append(s)
     return out[:limit]
+
+
+MINUTES_PER_GOLD = 1 / 230   # sin datos: minuto aproximado de compra por su precio (partida normal)
+
+
+def purchase_order(sugg: list[ItemSuggestion]) -> list[ItemSuggestion]:
+    """Orden de compra dentro de una fase: lo que se suele comprar antes, primero (minuto medio de STRATZ; sin
+    datos, por precio). Lo que ya tienes a medias (falta poco) va delante."""
+    def when(s: ItemSuggestion) -> float:
+        base = s.minute if s.minute is not None else s.cost * MINUTES_PER_GOLD
+        return base * (s.to_pay / s.cost if s.cost and s.remaining is not None else 1)
+    return sorted(sugg, key=when)
 
 
 def counters_for(gd: GameData, enemy: Hero, my_hero: Hero | None = None, role: str = "auto",

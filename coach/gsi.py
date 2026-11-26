@@ -46,6 +46,8 @@ class GameState:
     buyback_cost: int = 0
     gold: int = 0
     gpm: int = 0
+    income_gold: int = 0   # oro pasivo acumulado (player.gold_from_income)
+    turbo: bool = False    # partida turbo: el oro pasivo va al doble (~176/min frente a ~88/min, medido)
     kills: int = 0
     deaths: int = 0
     assists: int = 0
@@ -118,6 +120,14 @@ def parse_draft(draft) -> dict:
     return out
 
 
+TURBO_INCOME_PER_MIN = 130   # normal ≈ 88 oro pasivo/min, turbo ≈ 176 (grabaciones del 2026-11-25)
+
+
+def is_turbo(clock: int, income_gold: int) -> bool:
+    """GSI no dice el modo de juego; el oro pasivo sí lo delata (en turbo va al doble)."""
+    return clock >= 30 and income_gold / (clock / 60) > TURBO_INCOME_PER_MIN
+
+
 def parse_state(payload: dict) -> GameState:
     m = payload.get("map") or {}
     p = payload.get("player") or {}
@@ -131,6 +141,8 @@ def parse_state(payload: dict) -> GameState:
     st.paused = bool(m.get("paused", False))
     st.team = str(p.get("team_name") or "").lower()
     st.gold, st.gpm = _int(p.get("gold")), _int(p.get("gpm"))
+    st.income_gold = _int(p.get("gold_from_income"))
+    st.turbo = is_turbo(st.clock, st.income_gold)
     st.kills, st.deaths, st.assists = _int(p.get("kills")), _int(p.get("deaths")), _int(p.get("assists"))
     st.last_hits = _int(p.get("last_hits"))
     st.hero, st.hero_id = str(h.get("name") or ""), _int(h.get("id"))
@@ -195,7 +207,12 @@ def parse_state(payload: dict) -> GameState:
         me = unit == st.hero or image == "minimap_herocircle_self"
         # el icono manda: enemyicon = enemigo, herocircle = aliado (más fiable que 'team')
         enemy = image == "minimap_enemyicon" if image else (bool(my_team) and team != my_team)
-        if "xpos" in obj and "ypos" in obj:
+        x, y = _int(obj.get("xpos")), _int(obj.get("ypos"))
+        if (x, y) == (0, 0):
+            # posición sin datos (comprobado en una grabación: la Maiden "saltó" un instante a (0,0), el centro del
+            # mapa = mid, y parecía un TP): el héroe se ve, pero no se sabe dónde
+            pass
+        elif "xpos" in obj and "ypos" in obj:
             st.units.append(MapUnit(unit, team, _int(obj.get("xpos")), _int(obj.get("ypos")), enemy=enemy, me=me))
         if not me and (my_team or image):
             (st.visible_enemies if enemy else st.visible_allies).add(unit)

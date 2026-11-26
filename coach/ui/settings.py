@@ -473,7 +473,12 @@ class SettingsApp(ctk.CTk):
         self._switch(c, 12, "Notificaciones flotantes encima del juego, bajo los retratos (ganks, TPs, torres, "
                             "rachas)", "toasts",
                      self.cfg.get("toasts", True))
-        ctk.CTkLabel(c, text="").grid(row=13, column=0, pady=2)
+        self._switch(c, 13, "Ctrl+F1…F5: marcar que un enemigo ha usado su definitiva (huecos de la barra superior, "
+                            "de izquierda a derecha) y ver cuánto le queda", "ult_hotkeys",
+                     self.cfg.get("ult_hotkeys", True))
+        self._switch(c, 14, "Ver esa cuenta atrás encima del juego, debajo del retrato del enemigo", "ult_overlay",
+                     self.cfg.get("ult_overlay", True))
+        ctk.CTkLabel(c, text="").grid(row=15, column=0, pady=2)
 
     # ================= overlay =================
     def _build_overlay(self):

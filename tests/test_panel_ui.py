@@ -91,3 +91,45 @@ def test_preferred_monitor_is_the_secondary():
     assert preferred_monitor([main, second, small]) == second
     assert preferred_monitor([main]) == main and preferred_monitor([]) is None
     assert second.geometry == "1920x1050+1920+0"
+
+
+def test_enemy_ult_countdown_in_panel(gd, panel):
+    from coach.engine.ults import Ult, UltTracker, enemy_order
+    adv = Advisor(gd, None, json.loads(json.dumps(DEFAULTS)), None, sync=True)
+    pa, lion = gd.hero("pa"), gd.hero("Lion")
+    adv.set_enemies([pa, lion])
+    st = GameState(match_id="1", game_state="DOTA_GAMERULES_STATE_GAME_IN_PROGRESS", clock=600, team="radiant",
+                   hero="npc_dota_hero_juggernaut", hero_id=8, gold=1000, level=11)
+    ults = UltTracker(lambda h: Ult("lion_finger_of_death", "Finger of Death", [100, 80, 60]))
+    slots = enemy_order({5: lion, 6: pa}, "radiant", [pa, lion])
+    ults.cast(lion, 600, 11)
+    v = build_view(adv, None, st, ults=ults, enemy_slots=slots, ult_keys=True)
+    assert [e.hero.loc for e in v.enemies] == ["Lion", "Phantom Assassin"]   # orden de la barra = de los atajos
+    assert v.enemies[0].hotkey == "Ctrl+F1" and v.enemies[0].ult_left == (80, 100)
+    assert v.enemies[1].hotkey == "Ctrl+F2" and v.enemies[1].ult_left is None
+    panel.post("view", v)
+    panel._poll()
+    row = panel.enemy_pool.rows[0]
+    assert row["ult_text"].cget("text") == "80-100" and row["ult_box"].winfo_manager()
+
+
+def test_ult_badges_under_enemy_portraits(gd, panel):
+    from coach.ui.ultbadges import UltBadges, badge_text
+    from coach.ui.view import HeroCard, MatchView
+    assert badge_text(80, 100) == ("1:20-1:40", "cd") and badge_text(0, 8) == ("≤8", "maybe")
+    assert badge_text(0, 0) == ("LISTA", "ready") and badge_text(30, 30) == ("30", "cd")
+    front = {"v": True}
+    badges = UltBadges(panel, client_rect=lambda: (0, 0, 1920, 1080), in_front=lambda: front["v"])
+    lion, pa = gd.hero("Lion"), gd.hero("pa")
+    v = MatchView(in_game=True, team="radiant", enemies=[
+        HeroCard(lion, slot=0, ult_left=(80, 100)),
+        HeroCard(pa, slot=None, ult_left=(10, 10)),        # hueco sin reconocer: no se pinta en el juego
+        HeroCard(gd.hero("riki"), slot=2)])                 # sin marcar: nada
+    badges.update(v)
+    assert list(badges.badges) == [5] and badges.badges[5].shown
+    x, y, w, h = badges.box(5, (0, 0, 1920, 1080))
+    assert 960 + 135 - 33 <= x < 960 + 135 and y >= 39                 # bajo el primer retrato de Dire
+    front["v"] = False                                                  # alt+tab: se esconden
+    badges.update(v)
+    assert not badges.badges[5].shown
+    badges.destroy()

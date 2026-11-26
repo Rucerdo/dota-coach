@@ -86,7 +86,7 @@ def test_minimap_placeholders_in_strategy_time_are_ignored():
                "minimap": {"o1": {"unitname": "npc_dota_hero_lina", "team": 2, "image": "minimap_plaincircle",
                                   "xpos": 752, "ypos": -144},
                            "o2": {"unitname": "npc_dota_hero_viper", "team": 2, "image": "minimap_herocircle",
-                                  "xpos": 0, "ypos": 0},
+                                  "xpos": 300, "ypos": 200},
                            "o3": {"unitname": "npc_dota_hero_sven", "team": 3, "image": "minimap_enemyicon",
                                   "xpos": 10, "ypos": 10}}}
     st = parse_state(payload)

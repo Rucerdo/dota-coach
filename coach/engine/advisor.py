@@ -148,14 +148,14 @@ class Advisor:
         def run(ph):
             return suggest_items(self.gd, hero, list(self.enemies.values()), st.all_items,
                                  self.cfg.get("role", "auto"), self.meta, pop, limit=limit, phase=ph,
-                                 standard=self.standard or None, strict=ph is not None)
+                                 standard=self.standard or None, strict=ph is not None, turbo=st.turbo)
         if phase != "auto":
             return run(phase)
         # tu fase primero (de ahí sale la siguiente compra) y después la siguiente: los objetivos a medio plazo
         # (p. ej. la MKB contra PA en early) siguen a la vista para los consejos de counter y para la IA
         out: list[ItemSuggestion] = []
         upcoming = 0
-        for ph in PHASES[PHASES.index(phase_for(st.clock)):]:
+        for ph in PHASES[PHASES.index(phase_for(st.clock, st.turbo)):]:
             fresh = [s for s in run(ph) if s.item not in {o.item for o in out}]
             if out:  # ya hay objetos de tu fase: de las siguientes, solo los 3 primeros
                 fresh = fresh[:3 - upcoming]
@@ -212,7 +212,8 @@ class Advisor:
         enemies = list(self.enemies.values())
         lines = [
             f"Trigger: {', '.join(triggers)}",
-            f"Game time: {st.clock_text} ({'day' if st.daytime else 'night'})",
+            f"Game time: {st.clock_text} ({'day' if st.daytime else 'night'})"
+            + (" · TURBO game (double gold, everything happens about twice as fast)" if st.turbo else ""),
             f"My hero: {hero.loc if hero else st.hero} · level {st.level} · role {role} · "
             f"K/D/A {st.kills}/{st.deaths}/{st.assists} · last hits {st.last_hits}",
             f"Gold: {st.gold} · GPM {st.gpm} · buyback cost {st.buyback_cost}" + ("" if st.alive else

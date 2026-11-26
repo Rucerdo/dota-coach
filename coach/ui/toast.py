@@ -19,7 +19,8 @@ LEVELS = {                 # nivel → (color de la franja, color del icono)
 }
 WIDTH, GAP = 360, 8
 PANEL_TOP, PANEL_RIGHT = 108, 18
-GAME_TOP = 74              # px por debajo del borde superior de Dota (a 1080 de alto): justo bajo los retratos
+GAME_TOP = 88              # px por debajo del borde superior de Dota (a 1080 de alto): bajo los retratos y
+                           # los rótulos de definitivas (ui/ultbadges.py, hasta 83)
 SHOW_MS, MAX_TOASTS = 6500, 3
 STEP_MS, STEPS = 16, 14
 

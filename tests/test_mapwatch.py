@@ -44,15 +44,17 @@ def test_mia_and_stranger_near_and_tp(gd):
     for t in range(120, 150, 2):
         alerts += mw.update(_st(t, [(JUGG, False, BOT_LANE), (LION, True, TOP_LANE), (RIKI, True, MID)]))
     assert [a.kind for a in alerts] == ["mia"] and "Phantom Assassin" in alerts[0].text
-    # Lion (de top) aparece junto a ti: gank; tu rival de línea solo no avisa
-    near = mw.update(_st(152, [(JUGG, False, BOT_LANE), (LION, True, (5300, -5600)), (RIKI, True, MID)]))
-    assert {a.kind for a in near} == {"tp", "near"}  # salta de top a tu lado: TP y peligro a la vez
-    assert all("Lion" in a.text for a in near)
+    # Lion (de top) llega a tu lado junto a PA: 2 contra 1, gank; el salto de Lion se confirma como TP al seguir allí
+    gank = [(JUGG, False, BOT_LANE), (LION, True, (5300, -5600)), (PA, True, (5200, -5700)), (RIKI, True, MID)]
+    near = mw.update(_st(152, gank))
+    assert [a.kind for a in near] == ["near"] and "Lion" in near[0].text and "Phantom Assassin" in near[0].text
+    assert [a.kind for a in mw.update(_st(154, gank))] == ["tp"]
     quiet = MapWatch(gd)
     _laning(quiet)
     assert not quiet.update(_st(122, [(JUGG, False, BOT_LANE), (PA, True, (5200, -5700))]))
     # Riki salta de mid a top en 2 s: TP
-    tp = mw.update(_st(154, [(JUGG, False, BOT_LANE), (RIKI, True, (-6200, 2000))]))
+    assert not mw.update(_st(156, [(JUGG, False, BOT_LANE), (RIKI, True, (-6200, 2000))]))
+    tp = mw.update(_st(158, [(JUGG, False, BOT_LANE), (RIKI, True, (-6150, 2050))]))
     assert any(a.kind == "tp" and "Riki" in a.text and "top" in a.text for a in tp)
 
 
@@ -62,3 +64,46 @@ def test_no_near_alert_at_game_start_or_in_base(gd):
     assert not mw.update(_st(-60, [(JUGG, False, fountain), (PA, True, (-6600, -6100)), (LION, True, (-6700, -6300))]))
     assert not mw.update(_st(20, [(JUGG, False, MID), (PA, True, (100, 100)), (LION, True, (-100, 50)),
                                   (RIKI, True, (50, -50))]))
+
+
+def test_clones_count_once_and_do_not_fake_tps(gd):
+    """El clon de Arc Warden (mismo nombre) no cuenta como otro héroe ni parece un TP."""
+    arc = "npc_dota_hero_arc_warden"
+    gd.heroes[113] = type(gd.hero("pa"))(113, arc, "Arc Warden", ["Carry"], "Ranged")
+    gd._hero_index["arcwarden"] = gd.heroes[113]
+    mw = MapWatch(gd)
+    for t in range(30, 120, 2):
+        mw.update(_st(t, [(JUGG, False, BOT_LANE), (arc, True, (5100, -5700)), (PA, True, (5200, -5600))]))
+    clones = [(JUGG, False, BOT_LANE), (arc, True, (5100, -5700)), (arc, True, (5150, -5650)),
+              (PA, True, (5200, -5600))]
+    assert not mw.update(_st(122, clones))                       # 2 héroes de tu línea, no 3: nada
+    far = [(JUGG, False, BOT_LANE), (arc, True, (5100, -5700)), (arc, True, (-6000, 3000)), (PA, True, (5200, -5600))]
+    assert not [a for a in mw.update(_st(124, far)) if a.kind == "tp"]
+
+
+def test_ganking_another_lane_is_not_a_gank_on_you(gd):
+    mw = MapWatch(gd)
+    _laning(mw)
+    # tú (bot) vas a top con CM a por Lion: no es que te ganken a ti
+    top = (-6000, 3000)
+    assert not mw.update(_st(130, [(JUGG, False, top), (CM, False, top), (LION, True, (-6100, 3100))]))
+
+
+def test_dead_enemy_is_not_missing(gd):
+    mw = MapWatch(gd)
+    _laning(mw)
+    mw.mark_dead(PA, 120)
+    alerts = []
+    for t in range(120, 170, 2):
+        alerts += mw.update(_st(t, [(JUGG, False, BOT_LANE), (CM, False, BOT_LANE), (LION, True, TOP_LANE)]))
+    assert not [a for a in alerts if a.kind == "mia"]
+
+
+def test_a_single_position_glitch_is_not_a_tp(gd):
+    """Grabación real: la Maiden 'salta' un instante a otro sitio y vuelve. No es un TP."""
+    mw = MapWatch(gd)
+    _laning(mw)
+    alerts = mw.update(_st(120, [(JUGG, False, BOT_LANE), (PA, True, (200, 300))]))
+    alerts += mw.update(_st(122, [(JUGG, False, BOT_LANE), (PA, True, (5200, -5600))]))
+    alerts += mw.update(_st(124, [(JUGG, False, BOT_LANE), (PA, True, (5250, -5600))]))
+    assert not [a for a in alerts if a.kind == "tp"]

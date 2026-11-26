@@ -24,7 +24,7 @@ from .. import config
 from ..data.cache import download_file
 from ..data.gamedata import CDN, Hero
 from ..engine.benchmarks import describe
-from ..engine.counters import PHASE_LABELS, PHASES
+from ..engine.counters import PHASES, phase_labels
 from ..engine.timers import upcoming
 from .toast import ToastManager
 from .view import HeroCard, ItemCard, MatchView
@@ -47,7 +47,7 @@ PALETTES = {
     "day": {"bg": "#13110D", "card": "#221D16", "header": "#2A2219", "clock": "#F5C542"},
     "night": {"bg": "#090E1A", "card": "#121A2B", "header": "#152038", "clock": "#9FC3FF"},
 }
-TOAST_ICONS = {"mia": "?", "near": "⚔", "tp": "↯", "tower": "♜", "streak": "☠", "patch": "⚑"}
+TOAST_ICONS = {"mia": "?", "near": "⚔", "tp": "↯", "tower": "♜", "streak": "☠", "patch": "⚑", "ult": "✦"}
 MAX_TIPS = 60
 
 
@@ -216,6 +216,8 @@ class Panel(ctk.CTk):
         self.similar = None
         self.draft = None
         self.toast = ToastManager(self, cfg.get("toasts_position", "game"))
+        from .ultbadges import UltBadges
+        self.ult_badges = UltBadges(self, cfg.get("topbar"), enabled=bool(cfg.get("ult_overlay", True)))
         self.theme = "neutral"
         self._theme_colors = dict(PALETTES["neutral"])
         self._themed: list[tuple[object, str]] = [(self, "bg")]
@@ -897,7 +899,8 @@ class Panel(ctk.CTk):
     def _render_next(self):
         v = self.view
         card = v.next_item if v else None
-        setw(self.cards["next"]["extra"], text=PHASE_LABELS.get(v.phase, "") if v and v.hero else "")
+        setw(self.cards["next"]["extra"], text=(phase_labels(v.turbo).get(v.phase, "") + (" · turbo" if v.turbo else ""))
+             if v and v.hero else "")
         for w, grid in self.n_widgets:
             show(w, card is not None, **grid)
         if not card:
@@ -1089,7 +1092,7 @@ class Panel(ctk.CTk):
         self.ph_rows = {}
         self.ph_strips = {}
         for i, phase in enumerate(PHASES):
-            title = ctk.CTkLabel(body, text=PHASE_LABELS[phase], font=font(12, "bold"), text_color=MUTED,
+            title = ctk.CTkLabel(body, text=phase_labels()[phase], font=font(12, "bold"), text_color=MUTED,
                                  anchor="w")
             title.configure(width=96)
             title.grid(row=i, column=0, sticky="w", pady=2)
@@ -1113,7 +1116,7 @@ class Panel(ctk.CTk):
             show(title, not past)
             show(self.ph_strips[phase], not past)
             current = v is not None and phase == v.phase
-            setw(title, text=("▶ " if current else "") + PHASE_LABELS[phase],
+            setw(title, text=("▶ " if current else "") + phase_labels(v.turbo if v else False)[phase],
                  text_color=ACCENT if current else MUTED)
             cards = builds.get(phase, [])
             for slot, card in zip(slots, cards + [None] * (len(slots) - len(cards))):
@@ -1146,16 +1149,27 @@ class Panel(ctk.CTk):
             verdict.pack(side="left", padx=(6, 0))
             traits = ctk.CTkLabel(f, text="", font=font(10), text_color=MUTED, anchor="w", height=16)
             traits.grid(row=1, column=1, sticky="ew", pady=(0, 3))
+            # definitiva: icono + cuenta atrás (la marcas con Ctrl+F1…F5 al verla)
+            ult_box = ctk.CTkFrame(f, fg_color="transparent", width=1, height=1)
+            ult_box.grid(row=0, column=2, rowspan=2, padx=(4, 2))
+            ult_icon = ctk.CTkLabel(ult_box, text="", width=30, height=30, fg_color=BG, corner_radius=4)
+            ult_icon.pack()
+            ult_text = ctk.CTkLabel(ult_box, text="", font=font(8, "bold"), text_color=MUTED, height=12, width=56)
+            ult_text.pack()
+            ult_tip = Tooltip(ult_icon)
             strip = ctk.CTkFrame(f, fg_color="transparent", width=1, height=1)
-            strip.grid(row=0, column=2, rowspan=2, padx=(4, 6))
+            strip.grid(row=0, column=3, rowspan=2, padx=(4, 6), sticky="w")
+            f.grid_columnconfigure(2, minsize=54)
             counters = []
             for j in range(3):
                 icon = ctk.CTkLabel(strip, text="", width=40, height=30, fg_color=BG, corner_radius=3)
                 icon.grid(row=0, column=j, padx=(0, 3))
+                strip.grid_columnconfigure(j, minsize=46)   # un hueco vacío ocupa lo mismo que uno con icono
                 counters.append({"frame": icon, "icon": icon, "tip": Tooltip(icon), "col": j})
             tips = Tooltip(traits)
             return {"frame": f, "portrait": portrait, "name": name, "wr": wr, "verdict": verdict, "traits": traits,
-                    "traits_tip": tips, "counters": counters}
+                    "traits_tip": tips, "counters": counters, "ult_box": ult_box, "ult_icon": ult_icon,
+                    "ult_text": ult_text, "ult_tip": ult_tip}
         self.enemy_pool = Pool(factory)
 
     def _set_enemy(self, row, e: HeroCard):
@@ -1170,20 +1184,48 @@ class Panel(ctk.CTk):
         setw(row["verdict"], text=e.verdict.upper(), text_color=VERDICT_COLORS.get(e.verdict, YELLOW))
         traits = ", ".join(e.traits) or "–"
         setw(row["traits"], text=traits if len(traits) <= 46 else traits[:44] + "…")
+        self._set_enemy_ult(row, e)
         row["traits_tip"].text = traits
         for slot, card in zip(row["counters"], e.counters + [None] * (3 - len(e.counters))):
-            if card is None:
-                show(slot["frame"], False)
+            if card is None:  # hueco vacío pero en su sitio: así la definitiva queda alineada en todas las filas
+                setw(slot["icon"], image=None, text="", fg_color="transparent")
+                slot["tip"].text = ""
                 continue
-            show(slot["frame"], True, row=0, column=slot["col"], padx=(0, 3))
             icon = self.images.item(card.short, (40, 30))
-            setw(slot["icon"], image=icon, text="" if icon else "?")
+            setw(slot["icon"], image=icon, text="" if icon else "?", fg_color=BG)
             slot["tip"].text = f"Contra {e.hero.loc}: {card.loc} · {card.cost} de oro\n" + \
                 (card.reasons[0] if card.reasons else "")
 
+    def _set_enemy_ult(self, row, e: HeroCard):
+        if not e.ult_name and not e.hotkey:
+            show(row["ult_box"], False)
+            return
+        show(row["ult_box"], True, row=0, column=2, rowspan=2, padx=(4, 2))
+        icon = self.images.ability(e.ult_name, (30, 30)) if e.ult_name else None
+        setw(row["ult_icon"], image=icon, text="" if icon else "R")
+        key = e.hotkey or "atajo desactivado en los ajustes"
+        if e.ult_left is None:
+            setw(row["ult_text"], text=e.hotkey, text_color=MUTED)
+            row["ult_tip"].text = (f"{e.ult_loc or 'Definitiva'}: pulsa {key} al verla usar y aquí saldrá cuánto le "
+                                   f"queda (estimado). Ctrl+Shift+{e.hotkey.removeprefix('Ctrl+')} si ya la tiene."
+                                   if e.hotkey else f"{e.ult_loc or 'Definitiva'} ({key})")
+            return
+        lo, hi = e.ult_left
+        if hi == 0:
+            text, color = "LISTA", RED
+        elif lo == 0:
+            text, color = f"≤{hi}s", YELLOW      # puede estar lista ya
+        else:
+            text, color = (f"{lo}s" if lo == hi else f"{lo}-{hi}"), GREEN
+        setw(row["ult_text"], text=text, text_color=color)
+        row["ult_tip"].text = (f"{e.ult_loc}: lista en {lo}-{hi} s (estimado por tu nivel; sin Octarine ni "
+                               f"talentos). Vuelve a pulsar {key} si la usa otra vez.")
+
     def _render_enemies(self):
         enemies = self.view.enemies if self.view else []
-        setw(self.cards["enemies"]["extra"], text=f"{len(enemies)}/5 detectados")
+        keys = any(e.hotkey for e in enemies)
+        setw(self.cards["enemies"]["extra"], text=f"{len(enemies)}/5 detectados" + (" · Ctrl+F1-F5: definitiva usada"
+                                                                                       if keys else ""))
         self._empty("enemies", None if enemies else "Se detectan solos en la barra superior y el minimapa. También "
                                                     "puedes indicarlos en los ajustes antes de iniciar el coach.")
         self.enemy_pool.update(enemies, self._set_enemy)
@@ -1352,13 +1394,17 @@ class Panel(ctk.CTk):
         more = f"\n… y {len(changes) - 14} más" if len(changes) > 14 else ""
         self.h_patch_tip.text = "\n".join(f"{c.tag:6s} {c.detail}: {c.text}" for c in changes[:14]) + more
 
+    def _render_ult_badges(self):
+        self.ult_badges.update(self.view)   # cuenta atrás bajo los retratos enemigos, encima del juego
+
     # ---------- bucle ----------
     def _render(self):
         for part in (self._render_mode, self._render_draft, self._render_report, self._render_history,
                      self._render_header, self._render_map, self._render_inventory, self._render_next,
                      self._render_lanes, self._render_phases,
                      self._render_enemies, self._render_tips, self._render_similar, self._render_battle,
-                     self._render_patch, self._render_skills, self._render_mylane, self._render_theme):
+                     self._render_patch, self._render_skills, self._render_mylane, self._render_theme,
+                     self._render_ult_badges):
             try:
                 part()
             except Exception:

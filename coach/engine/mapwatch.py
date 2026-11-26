@@ -21,7 +21,7 @@ ZONE_LABELS = {"top": "top", "mid": "mid", "bot": "bot", "jungle": "la jungla", 
 FORTS = {2: (-5920, -5352), 3: (5528, 5000)}
 
 LANING = (30, 10 * 60)        # cuándo se mira quién va a cada línea (segundos de partida)
-MIA_SECONDS = 25
+MIA_SECONDS = 30
 MIA_UNTIL = 14 * 60           # después de la fase de líneas un enemigo "desaparecido" no significa nada
 NEAR_DISTANCE = 2200
 TP_DISTANCE = 4500
@@ -67,6 +67,9 @@ class MapWatch:
         self.last_seen: dict[str, tuple[int, int, int]] = {}      # enemigo → (reloj, x, y)
         self.cooldown: dict[tuple[str, str], int] = {}
         self.mia_warned: set[str] = set()
+        self.dead: dict[str, int] = {}      # enemigos muertos (hasta que se les vuelve a ver)
+        self.multi: set[str] = set()        # héroes con clon/ilusiones (su posición no sirve para TPs)
+        self.tp_pending: dict[str, tuple[int, int, int]] = {}   # salto visto una vez: se confirma en la siguiente
         self.me = ""
 
     # ---------- reparto de líneas ----------
@@ -103,46 +106,78 @@ class MapWatch:
         self.cooldown[key] = clock
         return True
 
+    def mark_dead(self, unit: str, clock: int):
+        """Un enemigo ha muerto (aviso de muerte de GSI): mientras no reaparezca no está "desaparecido"."""
+        self.dead[unit] = clock
+
     def update(self, st: GameState) -> list[Alert]:
         if not st.in_game or not st.units:
             return []
         clock, alerts = st.clock, []
         self.me = st.hero
+        # en turbo las líneas se rompen antes: reparto hasta el minuto 6 y "desaparecidos" hasta el 8
+        laning_end, mia_until = (6 * 60, 8 * 60) if st.turbo else (LANING[1], MIA_UNTIL)
         me = next((u for u in st.units if u.me), None)
-        seen_now = set()
+        # un nombre puede salir varias veces (clon de Arc Warden, ilusiones): cuenta como UN héroe, y un nombre
+        # repetido no sirve para detectar TPs (el clon y el original están en sitios distintos)
+        by_name: dict[str, list] = {}
         for u in st.units:
-            self.team[u.name] = u.enemy
-            if LANING[0] <= clock <= LANING[1]:
-                self.samples[u.name][zone(u.x, u.y)] += 1
+            by_name.setdefault(u.name, []).append(u)
+        seen_now = set()
+        for name, units in by_name.items():
+            u = units[0]
+            self.team[name] = u.enemy
+            if LANING[0] <= clock <= laning_end and len(units) == 1:
+                self.samples[name][zone(u.x, u.y)] += 1
             if not u.enemy:
                 continue
-            seen_now.add(u.name)
-            prev = self.last_seen.get(u.name)
-            if prev and 0 < clock - prev[0] <= TP_WINDOW and math.hypot(u.x - prev[1], u.y - prev[2]) > TP_DISTANCE:
-                z = zone(u.x, u.y)
-                if z != "base" and self._ready((u.name, "tp"), clock):
-                    alerts.append(Alert("tp", f"{self._name(u.name)} ha aparecido en {ZONE_LABELS[z]} (TP)", clock))
-            self.last_seen[u.name] = (clock, u.x, u.y)
-            self.mia_warned.discard(u.name)
+            seen_now.add(name)
+            self.dead.pop(name, None)  # se le ve: ya ha reaparecido
+            prev = self.last_seen.get(name)
+            if prev and len(units) > 1:
+                u = min(units, key=lambda x: math.hypot(x.x - prev[1], x.y - prev[2]))
+            elif prev and len(units) == 1 and name not in self.multi:
+                pend = self.tp_pending.pop(name, None)
+                if pend and clock - pend[0] <= 4 and math.hypot(u.x - pend[1], u.y - pend[2]) < 1500:
+                    # sigue allí: era un TP de verdad (un dato suelto de GSI vuelve a su sitio al momento)
+                    z = zone(u.x, u.y)
+                    if z != "base" and self._ready((name, "tp"), clock):
+                        alerts.append(Alert("tp", f"{self._name(name)} ha aparecido en {ZONE_LABELS[z]} (TP)", clock))
+                elif 0 < clock - prev[0] <= TP_WINDOW and math.hypot(u.x - prev[1], u.y - prev[2]) > TP_DISTANCE:
+                    self.tp_pending[name] = (clock, u.x, u.y)
+                    continue  # hasta confirmarlo se queda donde estaba (si era un dato suelto, nada cambia)
+            if len(units) > 1:
+                self.multi.add(name)  # tiene clon/ilusiones: su posición salta y no indica un TP
+            self.last_seen[name] = (clock, u.x, u.y)
+            self.mia_warned.discard(name)
 
         if me is None or not st.alive or clock < QUIET_START or zone(me.x, me.y) == "base":
             return alerts  # al salir de la fuente todos están juntos: no es un gank
         my_lane = self.my_lane()
-        # enemigos cerca de ti
-        near = [u for u in st.units if u.enemy and math.hypot(u.x - me.x, u.y - me.y) < NEAR_DISTANCE]
-        strangers = [u for u in near if my_lane and self.lane_of(u.name) not in (None, my_lane)]
-        # en la fase de líneas tus rivales de línea siempre están cerca: solo avisa si llega alguien de fuera
-        danger = (strangers or len(near) >= 3) if clock <= MIA_UNTIL else len(near) >= 2
-        if danger and self._ready(("near", "group"), clock, 20):
-            names = ", ".join(self._name(u.name) for u in near)
-            alerts.append(Alert("near", f"Cuidado: {names} cerca de ti", clock))
-        # enemigos de tu línea que han desaparecido
-        if my_lane and clock <= MIA_UNTIL and zone(me.x, me.y) == my_lane:
+        in_my_lane = bool(my_lane) and zone(me.x, me.y) == my_lane
+        # gank: más enemigos (héroes distintos) cerca de ti que aliados contigo
+        near_foes = {n for n, units in by_name.items() if units[0].enemy
+                     and any(math.hypot(x.x - me.x, x.y - me.y) < NEAR_DISTANCE for x in units)}
+        near_mates = {n for n, units in by_name.items() if not units[0].enemy
+                      and any(math.hypot(x.x - me.x, x.y - me.y) < NEAR_DISTANCE for x in units)}
+        outnumbered = len(near_foes) >= 2 and len(near_foes) > len(near_mates)
+        if clock <= mia_until:
+            # fase de líneas: solo en TU línea y si llega alguien de fuera (si gankeas tú en otra línea, no)
+            strangers = {n for n in near_foes if self.lane_of(n) not in (None, my_lane)}
+            danger = in_my_lane and bool(strangers) and outnumbered
+        else:
+            danger = outnumbered
+        if danger and self._ready(("near", "group"), clock, 25):
+            names = ", ".join(self._name(n) for n in sorted(near_foes))
+            alerts.append(Alert("near", f"Cuidado: {names} vienen a por ti", clock))
+        # enemigos de tu línea que han desaparecido (y no están muertos)
+        if in_my_lane and clock <= mia_until:
             for name, enemy in self.team.items():
-                if not enemy or name in seen_now or name in self.mia_warned or self.lane_of(name) != my_lane:
+                if (not enemy or name in seen_now or name in self.mia_warned or name in self.dead
+                        or self.lane_of(name) != my_lane):
                     continue
                 last = self.last_seen.get(name)
-                if last and clock - last[0] >= MIA_SECONDS:
+                if last and clock - last[0] >= MIA_SECONDS and zone(last[1], last[2]) == my_lane:
                     self.mia_warned.add(name)
                     alerts.append(Alert("mia", f"{self._name(name)} ha desaparecido de tu línea "
                                                f"(hace {clock - last[0]} s): cuidado con un gank", clock))

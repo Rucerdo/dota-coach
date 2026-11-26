@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from ..data.gamedata import Hero
 from ..data.patches import Change
 from ..engine.counters import (PHASES, TRAIT_LABELS, PlanStep, build_plan, counters_for, enemy_traits, item_role,
-                               next_purchase, phase_for)
+                               next_purchase, phase_for, purchase_order)
 from ..gsi import GameState
 
 ROLE_LABELS = {"carry": "carry", "core": "core", "support": "support"}
@@ -37,6 +37,11 @@ class HeroCard:
     trend: float = 0.0
     verdict: str = ""                                  # buff | nerf | mixto | ...
     counters: list[ItemCard] = field(default_factory=list)  # qué comprar contra ESTE héroe
+    hotkey: str = ""                                   # Ctrl+F1…F5 para marcar su definitiva
+    slot: int | None = None                            # hueco 0-4 de su bando, si la visión lo ha reconocido
+    ult_name: str = ""                                 # icono de Valve (p. ej. enigma_black_hole)
+    ult_loc: str = ""
+    ult_left: tuple[int, int] | None = None            # segundos que le faltan (mín, máx); None = sin marcar
 
 
 @dataclass
@@ -78,6 +83,7 @@ class MatchView:
     dire_score: int = 0
     drafting: bool = False
     phase: str = "start"
+    turbo: bool = False                 # partida turbo (detectada por el oro pasivo)
     next_item: ItemCard | None = None
     build: list[ItemCard] = field(default_factory=list)          # resto de la fase actual
     phase_builds: dict[str, list[ItemCard]] = field(default_factory=dict)  # start/early/mid/late
@@ -107,7 +113,9 @@ def hero_card(hero: Hero, meta, gd=None, my_hero: Hero | None = None, role: str 
 INVENTORY_SLOTS = [f"slot{i}" for i in range(9)] + ["neutral0", "teleport0"]
 
 
-def build_view(advisor, meta, st: GameState, build_size: int = 6, mapwatch=None) -> MatchView:
+def build_view(advisor, meta, st: GameState, build_size: int = 6, mapwatch=None, ults=None,
+               enemy_slots: list | None = None, ult_keys: bool = False,
+               confirmed_slots: dict[int, int] | None = None) -> MatchView:
     hero = advisor.my_hero(st)
     v = MatchView(
         in_game=st.in_game, game_state=st.game_state, hero=hero, team=st.team, level=st.level, clock=st.clock,
@@ -123,10 +131,12 @@ def build_view(advisor, meta, st: GameState, build_size: int = 6, mapwatch=None)
     )
     if mapwatch is not None:
         v.lanes, v.my_lane = mapwatch.lanes(), mapwatch.my_lane()
-    v.phase = phase_for(st.clock)
+    v.phase, v.turbo = phase_for(st.clock, st.turbo), st.turbo
     if hero:
         for phase in PHASES:
             sugg = advisor.suggestions(st, phase=phase, limit=build_size)
+            if phase != "start":  # al salir se compra todo a la vez
+                sugg = purchase_order(sugg)
             v.phase_builds[phase] = [ItemCard(s.item, s.loc, s.cost, list(dict.fromkeys(s.reasons)), s.patch_note,
                                               s.remaining) for s in sugg]
         owned = st.all_items
@@ -140,6 +150,21 @@ def build_view(advisor, meta, st: GameState, build_size: int = 6, mapwatch=None)
         hm = meta.hero(hero) if meta is not None else None
         v.my_changes = list(hm.changes) if hm else []
     role = advisor.cfg.get("role", "auto")
-    v.enemies = [hero_card(h, meta, advisor.gd, hero, role, st.all_items) for h in list(advisor.enemies.values())]
+    # en el orden de la barra superior (el de los atajos Ctrl+F1…F5)
+    order = [h for h in (enemy_slots or []) if h] or list(advisor.enemies.values())
+    v.enemies = [hero_card(h, meta, advisor.gd, hero, role, st.all_items) for h in order]
+    for i, card in enumerate(v.enemies):
+        card.slot = (confirmed_slots or {}).get(card.hero.id)
+        if ult_keys and enemy_slots:
+            pos = next((j for j, h in enumerate(enemy_slots) if h and h.id == card.hero.id), None)
+            card.hotkey = f"Ctrl+F{pos + 1}" if pos is not None else ""
+        if ults is not None:
+            ult = ults.ult_info_cached(card.hero) if hasattr(ults, "ult_info_cached") else None
+            timer = ults.get(card.hero, st.clock)
+            ult = timer.ult if timer else ult
+            if ult:
+                card.ult_name, card.ult_loc = ult.name, ult.loc
+            if timer:
+                card.ult_left = timer.remaining(st.clock)
     v.allies = [h for h in advisor.allies.values() if not hero or h.id != hero.id]
     return v
