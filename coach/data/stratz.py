@@ -197,6 +197,62 @@ def item_popularity(hero_id: int, bracket: int = 0) -> dict:
     return out
 
 
+# ---------- builds reales (guías de STRATZ: partidas GANADAS de buenos jugadores con ese héroe) ----------
+GUIDE_GQL = """
+query Guides($heroId: Short!, $against: Short, $with: Short, $take: Int) {
+  heroStats { guide(heroId: $heroId, againstHeroId: $against, withHeroId: $with, take: 1) {
+    guides(take: $take) { matchId } } }
+}"""
+MATCH_FIELDS = ("id durationSeconds gameMode players { heroId isVictory position isRadiant "
+                "stats { itemPurchases { itemId time } } }")
+MATCH_BATCH = 10   # STRATZ no deja pedir más partidas de golpe (y matches(ids) es solo para administradores)
+
+
+def hero_builds(hero_id: int, against: int | None = None, with_hero: int | None = None, take: int = 30,
+                ttl: float = 86400) -> list[dict]:
+    """Builds reales de tu héroe: [{match, win, minutes, position, enemies, allies, purchases: [[item_id, minuto]]}].
+    Con 'against'/'with_hero', solo partidas contra/con ese héroe. Se guardan un día (y se borran con cada parche)."""
+    name = f"stratz_builds_{hero_id}_{against or 0}_{with_hero or 0}"
+    hit = read_cached(name)
+    import time
+    if hit and time.time() - hit[0] < ttl:
+        return hit[1]
+    try:
+        data = query(GUIDE_GQL, {"heroId": int(hero_id), "against": against, "with": with_hero, "take": take})
+        lists = (data.get("heroStats") or {}).get("guide") or []
+        ids = [g["matchId"] for gl in lists for g in (gl.get("guides") or []) if g.get("matchId")][:take]
+        out = []
+        for i in range(0, len(ids), MATCH_BATCH):
+            body = " ".join(f"m{j}: match(id: {int(mid)}) {{ {MATCH_FIELDS} }}"
+                            for j, mid in enumerate(ids[i:i + MATCH_BATCH]))
+            for m in query("query { " + body + " }").values():
+                row = _build_row(m, hero_id)
+                if row:
+                    out.append(row)
+    except StratzError:
+        if hit:
+            return hit[1]
+        raise
+    write_cached(name, out)
+    return out
+
+
+def _build_row(match: dict | None, hero_id: int) -> dict | None:
+    if not match:
+        return None
+    me = next((p for p in match.get("players") or [] if p.get("heroId") == hero_id), None)
+    if not me:
+        return None
+    purchases = [[int(e["itemId"]), round(e["time"] / 60, 1)]
+                 for e in ((me.get("stats") or {}).get("itemPurchases") or []) if e.get("itemId")]
+    side = me.get("isRadiant")
+    return {"match": match.get("id"), "win": bool(me.get("isVictory")), "position": me.get("position") or "",
+            "minutes": round((match.get("durationSeconds") or 0) / 60), "mode": match.get("gameMode") or "",
+            "enemies": [p["heroId"] for p in match["players"] if p.get("isRadiant") != side],
+            "allies": [p["heroId"] for p in match["players"] if p.get("isRadiant") == side and p is not me],
+            "purchases": purchases}
+
+
 def introspect(names=("HeroStatsQuery", "HeroMatchupType", "HeroDryadType", "RankBracketBasicEnum")) -> dict:
     """Campos reales de los tipos que usamos (para comprobar las consultas cuando haya clave)."""
     out = {}
@@ -215,4 +271,4 @@ def check(key: str) -> str:
     return f"STRATZ responde: {len(block.get('vs') or [])} enfrentamientos de Juggernaut"
 
 
-__all__ = ["KEY_PAGE", "StratzError", "check", "introspect", "matchup", "query", "token"]
+__all__ = ["KEY_PAGE", "StratzError", "check", "hero_builds", "introspect", "matchup", "query", "token"]

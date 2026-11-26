@@ -23,6 +23,7 @@ class ItemCard:
     patch_note: str = ""
     to_pay: int | None = None   # descontando componentes que ya llevas (None = el precio entero)
     plan: list[PlanStep] = field(default_factory=list)  # componentes: los que llevas ✓ y el orden del resto
+    owned: bool = False        # ya comprado: se queda en su fase con un tick
 
     @property
     def short(self) -> str:
@@ -42,6 +43,29 @@ class HeroCard:
     ult_name: str = ""                                 # icono de Valve (p. ej. enigma_black_hole)
     ult_loc: str = ""
     ult_left: tuple[int, int] | None = None            # segundos que le faltan (mín, máx); None = sin marcar
+
+
+@dataclass
+class GuideInfo:
+    id: str
+    source: str
+    role: str
+    minutes: int
+    done: int
+    total: int
+    items: list[tuple[str, bool]]      # (nombre del objeto, ya comprado)
+    note: str = ""
+
+
+@dataclass
+class DeviationInfo:
+    item: str               # lo que compraste fuera de la guía
+    item_loc: str
+    suggestion: str         # lo que hicieron las builds ganadoras parecidas
+    suggestion_loc: str
+    guide_next: str | None
+    guide_next_loc: str
+    reason: str
 
 
 @dataclass
@@ -84,6 +108,8 @@ class MatchView:
     drafting: bool = False
     phase: str = "start"
     turbo: bool = False                 # partida turbo (detectada por el oro pasivo)
+    guide: GuideInfo | None = None      # la guía elegida (si es de tu héroe)
+    deviation: DeviationInfo | None = None   # te has salido de la guía: propuesta para adaptarla
     next_item: ItemCard | None = None
     build: list[ItemCard] = field(default_factory=list)          # resto de la fase actual
     phase_builds: dict[str, list[ItemCard]] = field(default_factory=dict)  # start/early/mid/late
@@ -132,19 +158,48 @@ def build_view(advisor, meta, st: GameState, build_size: int = 6, mapwatch=None,
     if mapwatch is not None:
         v.lanes, v.my_lane = mapwatch.lanes(), mapwatch.my_lane()
     v.phase, v.turbo = phase_for(st.clock, st.turbo), st.turbo
+    guide = advisor.active_guide() if hasattr(advisor, "active_guide") else None
+    if guide:
+        done, total = advisor.follower.progress(advisor.ever_owned)
+        v.guide = GuideInfo(guide.id, guide.source, guide.role, guide.minutes, done, total,
+                            [(advisor.gd.item(n).loc if advisor.gd.item(n) else n, n in advisor.ever_owned)
+                             for n in guide.items], guide.note)
+        dev = advisor.guide_deviation(st)
+        if dev:
+            gi = advisor.gd.item
+            v.deviation = DeviationInfo(dev.item, gi(dev.item).loc if gi(dev.item) else dev.item, dev.suggestion,
+                                        gi(dev.suggestion).loc if gi(dev.suggestion) else dev.suggestion,
+                                        dev.guide_next, (gi(dev.guide_next).loc if dev.guide_next and
+                                                         gi(dev.guide_next) else ""), dev.reason)
     if hero:
         for phase in PHASES:
             sugg = advisor.suggestions(st, phase=phase, limit=build_size)
             if phase != "start":  # al salir se compra todo a la vez
                 sugg = purchase_order(sugg)
-            v.phase_builds[phase] = [ItemCard(s.item, s.loc, s.cost, list(dict.fromkeys(s.reasons)), s.patch_note,
-                                              s.remaining) for s in sugg]
+            pending = [ItemCard(s.item, s.loc, s.cost, list(dict.fromkeys(s.reasons)), s.patch_note, s.remaining)
+                       for s in sugg]
+            done = [ItemCard(n, advisor.gd.item(n).loc, advisor.gd.item(n).cost, [], owned=True)
+                    for n in advisor.done_in_phase(phase, [s.item for s in sugg]) if advisor.gd.item(n)]
+            # lo comprado se queda en su fase con un tick (no desaparece); siempre caben al menos 3 pendientes
+            keep = max(min(3, len(pending)), build_size - len(done))
+            pending = pending[:keep]
+            done = done[-(build_size - len(pending)):] if build_size > len(pending) else []
+            v.phase_builds[phase] = done + pending
         owned = st.all_items
         for cards in v.phase_builds.values():
             for c in cards:
                 c.plan = build_plan(advisor.gd, c.name, owned)
-        cards = v.phase_builds.get(v.phase, [])
+        cards = [c for c in v.phase_builds.get(v.phase, []) if not c.owned]
         v.next_item, v.build = (cards[0] if cards else None), cards[1:]
+        nxt = advisor.follower.next_items(advisor.ever_owned, 1) if guide else []
+        if nxt and advisor.gd.item(nxt[0]):
+            # con guía, la siguiente compra es la de la guía (aunque por precio parezca de otra fase)
+            it = advisor.gd.item(nxt[0])
+            minute = dict(guide.core).get(nxt[0], 0)
+            why = [f"tu guía: paso {v.guide.done + 1} de {v.guide.total}" +
+                   (f" (en la partida original, minuto {minute:.0f})" if minute else "")]
+            v.next_item = ItemCard(it.name, it.loc, it.cost, why, plan=build_plan(advisor.gd, it.name, owned))
+            v.build = [c for c in cards if c.name != it.name]
         if v.next_item:
             v.buy_now = next_purchase(v.next_item.plan, st.gold)
         hm = meta.hero(hero) if meta is not None else None

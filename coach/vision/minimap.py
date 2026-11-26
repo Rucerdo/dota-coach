@@ -10,7 +10,7 @@ import logging
 import threading
 from typing import Callable
 
-from PIL import Image, ImageGrab
+from PIL import Image
 
 from .topbar import dota_client_rect
 
@@ -43,17 +43,14 @@ def capture_minimap(cfg: dict | None = None) -> Image.Image | None:
     client = dota_client_rect()
     if not client:
         return None
-    try:
-        return ImageGrab.grab(minimap_box(client, cfg), all_screens=True)
-    except OSError:
-        log.exception("no se pudo capturar el minimapa")
-        return None
+    from .wincap import grab_dota
+    return grab_dota(minimap_box(client, cfg), client)   # de la ventana de Dota: no lo que haya encima
 
 
 class MinimapFeed:
     """Captura el minimapa cada 'interval' segundos mientras 'active' está puesto y se lo pasa a on_frame."""
 
-    def __init__(self, on_frame: Callable[[Image.Image], None], cfg: dict | None = None, interval: float = 0.25):
+    def __init__(self, on_frame: Callable[[Image.Image], None], cfg: dict | None = None, interval: float = 0.1):
         self.on_frame, self.cfg, self.interval = on_frame, cfg, interval
         self.active = threading.Event()
         self._stop = threading.Event()
@@ -67,7 +64,10 @@ class MinimapFeed:
                         self.on_frame(frame)
                     except Exception:
                         log.exception("error con el fotograma del minimapa")
-            self._stop.wait(self.interval)
+            from .wincap import dota_in_front
+            # con Dota delante la copia cuesta ~8 ms (10 por segundo por defecto); si está tapado se lee la ventana
+            # entera de Dota (~45 ms): entonces solo 4 por segundo
+            self._stop.wait(self.interval if dota_in_front() else max(self.interval, 0.25))
 
     def start(self):
         threading.Thread(target=self.run, daemon=True).start()

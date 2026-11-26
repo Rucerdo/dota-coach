@@ -42,7 +42,11 @@ class Advisor:
                  extra_context: Callable[[GameState], list[str]] | None = None):
         self.gd, self.meta, self.cfg, self.provider = gd, meta, cfg, provider
         self.extra_context = extra_context
-        self.standard: dict[str, tuple[float, str]] = {}  # de partidas parecidas (lo pone el modo en directo)  # líneas extra para la IA: mapa, líneas, plan de compra, percentiles
+        self.standard: dict[str, tuple[float, str]] = {}  # de partidas parecidas (lo pone el modo en directo)
+        from .buildpaths import BuildPaths
+        self.paths = BuildPaths(gd)   # builds reales de STRATZ de tu héroe (las carga el modo en directo)
+        from .guides import GuideFollower
+        self.follower = GuideFollower(gd)   # la guía que has elegido (sigue entre partidas con el mismo héroe)
         self.on_tips, self.popularity, self.sync = on_tips, popularity, sync
         adv = cfg.get("advisor", {})
         self.min_ai_gap = float(adv.get("min_seconds_between_ai", 45))
@@ -64,6 +68,13 @@ class Advisor:
         self.started = False
         self.deaths = 0
         self.last_periodic = 0
+        self.bought: list[str] = []          # objetos importantes en el orden en que los has comprado
+        self.ever_owned: set[str] = set()    # todo lo que has llegado a tener (para marcarlo en la build por fases)
+        self.purchase_order: list[str] = []  # todo lo que has tenido, en orden
+        self.bought_phase: dict[str, str] = {}
+        self.phase_seen: dict[str, list[str]] = {}   # fase → objetos que se han sugerido en ella
+        if hasattr(self, "paths"):
+            self.paths.builds.clear()            # eran de tu héroe de la partida anterior
         self.announced_items: set[str] = set()
         self.recent: list[str] = []
         self.last_ai_call = 0.0
@@ -97,11 +108,64 @@ class Advisor:
             self.enemies.pop(me.id, None)
         if not st.in_game:
             return
+        self.track_purchases(st)
         self.set_allies([h for h in map(self.gd.hero, st.visible_allies) if h])
         self.set_enemies([h for h in map(self.gd.hero, st.visible_enemies) if h])
         triggers = self.triggers(st)
         if triggers:
             self.advise(st, triggers)
+
+    def track_purchases(self, st: GameState):
+        from .buildpaths import CORE_MIN_COST
+        for name in st.all_items:
+            if not name or name in self.ever_owned:
+                continue
+            self.ever_owned.add(name)
+            self.purchase_order.append(name)
+            self.bought_phase.setdefault(name, phase_for(st.clock, st.turbo))
+            item = self.gd.item(name)
+            if item and item.cost >= CORE_MIN_COST:
+                self.bought.append(name)
+
+    def done_in_phase(self, phase: str, suggested: list[str]) -> list[str]:
+        """Lo ya comprado que va en esta fase de la build, en el orden en que se compró: lo que se te sugirió aquí
+        y lo importante que compraste por tu cuenta en esta fase."""
+        seen = self.phase_seen.setdefault(phase, [])
+        others = {n for k, v in self.phase_seen.items() if k != phase for n in v}
+        for name in suggested:
+            if name not in seen and name not in others:
+                seen.append(name)
+        mine = [n for n in seen if n in self.ever_owned]
+        own_choice = [n for n in self.bought if self.bought_phase.get(n) == phase and n not in seen
+                      and n not in others]
+        order = {n: i for i, n in enumerate(self.purchase_order)}
+        return sorted(dict.fromkeys(mine + own_choice), key=lambda n: order.get(n, 999))
+
+    def active_guide(self):
+        g = self.follower.guide
+        return g if g and g.hero_id == self.my_hero_id else None
+
+    def guide_deviation(self, st: GameState):
+        if not self.active_guide():
+            return None
+        return self.follower.deviation(self.bought, st.all_items, self.paths, set(self.enemies), set(self.allies))
+
+    def standard_now(self, st: GameState) -> dict[str, tuple[float, str]]:
+        """Partidas parecidas + builds reales que siguen tu mismo camino (se recalcula con cada compra) + tu guía."""
+        out = dict(self.standard)
+        guide = self.active_guide()
+        if guide:
+            done, total = self.follower.progress(self.ever_owned)
+            for k, name in enumerate(self.follower.next_items(self.ever_owned, 2)):
+                out[name] = (1.0 if k == 0 else 0.6, f"tu guía: paso {done + k + 1} de {total}")
+            return out  # con guía, manda la guía (las builds parecidas se ofrecen solo si te desvías)
+        if len(self.paths):
+            names = {h.id: h.loc for h in self.enemies.values()}
+            for name, (share, why) in self.paths.suggest(st.all_items, self.bought, set(self.enemies),
+                                                         set(self.allies), names).items():
+                if share > out.get(name, (0.0, ""))[0]:
+                    out[name] = (share, why)
+        return out
 
     def triggers(self, st: GameState) -> list[str]:
         out = []
@@ -144,11 +208,12 @@ class Advisor:
         fase, se pasa a la siguiente."""
         hero = self.my_hero(st)
         pop = self._popularity(hero)
+        standard = self.standard_now(st)
 
         def run(ph):
             return suggest_items(self.gd, hero, list(self.enemies.values()), st.all_items,
                                  self.cfg.get("role", "auto"), self.meta, pop, limit=limit, phase=ph,
-                                 standard=self.standard or None, strict=ph is not None, turbo=st.turbo)
+                                 standard=standard or None, strict=ph is not None, turbo=st.turbo)
         if phase != "auto":
             return run(phase)
         # tu fase primero (de ahí sale la siguiente compra) y después la siguiente: los objetivos a medio plazo

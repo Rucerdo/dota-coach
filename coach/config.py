@@ -31,6 +31,7 @@ DEFAULTS = {
         "max_tips": 2,
     },
     "check_updates": True,
+    "minimap_fps": 10,          # copias por segundo del minimapa en el panel (con Dota delante; tapado, 4)
     "ult_hotkeys": True,
     "ult_overlay": True,        # cuenta atrás de esas definitivas encima del juego, bajo el retrato del enemigo        # Ctrl+F1…F5: marcar la definitiva de un enemigo (huecos de la barra superior)      # buscar versiones nuevas de la aplicación (GitHub Releases) al abrir
     "toasts": True,             # notificaciones flotantes (ganks, TPs, torres, rachas)

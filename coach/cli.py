@@ -275,16 +275,20 @@ def _vision_test(args, cfg, gd, topbar):
 
 
 def cmd_autostart(args, cfg, gd=None):
-    """Espera a que se abra Dota, lanza el coach y lo cierra al cerrar Dota (lo registra el arranque de Windows)."""
+    """Espera a que se abra Dota, lanza el coach y lo cierra al cerrar Dota (lo registra el arranque de Windows).
+
+    El coach va en un PROCESO NUEVO cada vez: este vigilante se queda abierto días y, si lanzara el coach dentro de
+    sí, mezclaría el código que cargó al arrancar Windows con el actual (pasó: la tarjeta de enemigos fallaba tras
+    actualizar). Así cada partida usa siempre la versión instalada en ese momento (también tras autoactualizarse)."""
+    import subprocess
     from .autostart import run_autostart
-    from .live import run_live
+    from .ui.settings import ROOT, live_command
 
     def start(fresh_cfg, should_stop):
-        from .data import updater
-        update = updater.check()
-        data = GameData.load()
-        run_live(fresh_cfg, data, Meta.build(data, fresh_cfg.get("rank_bracket", 0)), should_stop=should_stop,
-                 update=update)
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        cwd = None if getattr(sys, "frozen", False) else str(ROOT)
+        proc = subprocess.Popen(live_command() + ["--with-dota"], cwd=cwd, creationflags=flags)
+        proc.wait()  # se cierra solo al cerrar Dota (--with-dota) o al cerrar el panel
     run_autostart(config.load, start)
 
 
@@ -321,7 +325,12 @@ def cmd_report(args, cfg, gd=None):
 def cmd_run(args, cfg, gd):
     from .live import run_live
     meta = Meta.build(gd, cfg.get("rank_bracket", 0))
-    run_live(cfg, gd, meta, _heroes(gd, args.enemies, "enemigos"), update=getattr(args, "update", None))
+    should_stop = None
+    if getattr(args, "with_dota", False):
+        from .autostart import DotaWatcher
+        should_stop = DotaWatcher().should_stop   # lanzado por el arranque automático: cerrar al cerrar Dota
+    run_live(cfg, gd, meta, _heroes(gd, args.enemies, "enemigos"), update=getattr(args, "update", None),
+             should_stop=should_stop)
 
 
 def main(argv=None):
@@ -370,6 +379,7 @@ def main(argv=None):
 
     p = sub.add_parser("run", help="modo en directo con overlay")
     p.add_argument("--enemies", help="enemigos conocidos (si la visión no los detecta)")
+    p.add_argument("--with-dota", action="store_true", help="cerrarse cuando se cierre Dota (arranque automático)")
 
     for name in ("install", "uninstall"):
         p = sub.add_parser(name, help=f"{name} la integración GSI en Dota")

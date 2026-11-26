@@ -135,6 +135,21 @@ class Tooltip:
             self.tip = None
 
 
+def ticked(img: Image.Image) -> Image.Image:
+    """Icono de un objeto que ya tienes: algo apagado y con una marca verde en la esquina."""
+    from PIL import ImageDraw, ImageEnhance
+    out = ImageEnhance.Brightness(img.convert("RGB")).enhance(0.45).convert("RGBA")
+    w, h = out.size
+    r = int(h * 0.34)
+    cx, cy = w - r - int(w * 0.04), h - r - int(h * 0.05)
+    d = ImageDraw.Draw(out)
+    d.ellipse((cx - r, cy - r, cx + r, cy + r), fill=(46, 160, 67, 255), outline=(255, 255, 255, 255),
+              width=max(1, r // 6))
+    d.line([(cx - r * 0.5, cy + r * 0.02), (cx - r * 0.12, cy + r * 0.42), (cx + r * 0.55, cy - r * 0.38)],
+           fill=(255, 255, 255, 255), width=max(2, r // 3), joint="curve")
+    return out
+
+
 class ImageStore:
     """Retratos e iconos: del disco si ya están; si no, se descargan en segundo plano (una vez)."""
 
@@ -151,8 +166,8 @@ class ImageStore:
             if download_file(url, path):
                 self.changed.set()
 
-    def _get(self, url: str, path, size: tuple[int, int]):
-        key = (str(path), size)
+    def _get(self, url: str, path, size: tuple[int, int], done: bool = False):
+        key = (str(path), size, done)
         if key in self._images:
             return self._images[key]
         if path.exists():
@@ -160,6 +175,8 @@ class ImageStore:
                 img = Image.open(path).convert("RGBA")
             except OSError:
                 return None
+            if done:
+                img = ticked(img)
             self._images[key] = ctk.CTkImage(light_image=img, dark_image=img, size=size)
             return self._images[key]
         if path not in self._pending:
@@ -176,9 +193,9 @@ class ImageStore:
         return self._get(f"{CDN}/apps/dota2/images/dota_react/abilities/{name}.png",
                          config.CACHE_DIR / "ability_img" / f"{name}.png", size)
 
-    def item(self, short: str, size=(44, 32)):
+    def item(self, short: str, size=(44, 32), done: bool = False):
         return self._get(f"{CDN}/apps/dota2/images/dota_react/items/{short}.png",
-                         config.CACHE_DIR / "item_img" / f"{short}.png", size)
+                         config.CACHE_DIR / "item_img" / f"{short}.png", size, done)
 
 
 class Pool:
@@ -216,6 +233,8 @@ class Panel(ctk.CTk):
         self.similar = None
         self.draft = None
         self.toast = ToastManager(self, cfg.get("toasts_position", "game"))
+        self.actions: dict = {}         # lo pone el modo en directo: guías, aceptar/rechazar desvíos…
+        self.guide_window = None
         from .ultbadges import UltBadges
         self.ult_badges = UltBadges(self, cfg.get("topbar"), enabled=bool(cfg.get("ult_overlay", True)))
         self.theme = "neutral"
@@ -253,6 +272,9 @@ class Panel(ctk.CTk):
         self._build_inventory(self._card(0, "inventory", "Tu inventario"))
         self._build_next(self._card(0, "next", "Siguiente compra"))
         self._build_phases(self._card(0, "phases", "Build por fases"))
+        ctk.CTkButton(self.cards["phases"]["head"], text="Guías…", width=72, height=22, font=font(11, "bold"),
+                      fg_color=CARD2, hover_color="#323C4B", command=self.open_guides).pack(side="right",
+                                                                                         padx=(0, 8))
         self._build_skills(self._card(0, "skills", "Habilidades y talentos"))
         # centro: la partida (mapa, torres y bajas, consejos)
         # mapa y últimos consejos en la misma fila (el mapa solo ocupa la mitad del ancho)
@@ -272,6 +294,7 @@ class Panel(ctk.CTk):
         self._render()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.after(250, self._poll)
+        self.after(250, self._map_loop)
 
     def _place(self, pcfg: dict):
         """Por defecto, maximizado en la pantalla secundaria si la hay (el juego va en la principal); con
@@ -307,7 +330,7 @@ class Panel(ctk.CTk):
         body.grid_columnconfigure(0, weight=1)
         empty = ctk.CTkLabel(body, text="", font=font(11), text_color=MUTED, wraplength=400, justify="left",
                              anchor="w")
-        self.cards[key] = {"body": body, "extra": extra, "empty": empty, "frame": card}
+        self.cards[key] = {"body": body, "extra": extra, "empty": empty, "frame": card, "head": head}
         self._themed.append((card, "card"))
         return body
 
@@ -895,9 +918,61 @@ class Panel(ctk.CTk):
                           (self.n_bar, dict(row=3, column=0, columnspan=2, sticky="ew", pady=(4, 1))),
                           (self.n_state, dict(row=4, column=0, columnspan=2, sticky="w"))]
         # el plan y el "compra ahora" se muestran aparte: solo si el objeto tiene componentes
+        self.n_guide = ctk.CTkLabel(body, text="", font=font(10, "bold"), text_color=CYAN, anchor="w", height=16)
+        self.n_guide_tip = Tooltip(self.n_guide)
+        self.dev_box = ctk.CTkFrame(body, fg_color=CARD2, corner_radius=8, border_width=1, border_color=YELLOW)
+        self.dev_box.grid_columnconfigure(0, weight=1)
+        self.dev_text = ctk.CTkLabel(self.dev_box, text="", font=font(11), text_color=TEXT, anchor="w",
+                                     justify="left", wraplength=420)
+        self.dev_text.grid(row=0, column=0, columnspan=3, sticky="ew", padx=10, pady=(6, 4))
+        self.dev_accept = ctk.CTkButton(self.dev_box, text="Aceptar y adaptar la guía", height=24, width=170,
+                                        font=font(11, "bold"), fg_color=GREEN, text_color="#0E1116",
+                                        hover_color="#3B8F50", command=lambda: self._deviation("accept"))
+        self.dev_accept.grid(row=1, column=0, sticky="w", padx=10, pady=(0, 8))
+        self.dev_keep = ctk.CTkButton(self.dev_box, text="Seguir con mi guía", height=24, width=140,
+                                      font=font(11), fg_color=CARD, hover_color="#323C4B",
+                                      command=lambda: self._deviation("dismiss"))
+        self.dev_keep.grid(row=1, column=1, sticky="w", padx=(0, 10), pady=(0, 8))
+
+    def open_guides(self):
+        """Buscador de guías (una sola ventana a la vez)."""
+        if self.guide_window is not None and self.guide_window.winfo_exists():
+            self.guide_window.lift()
+            self.guide_window.focus_force()
+            return
+        opts = self.actions.get("guides")
+        if not opts:
+            self.toast.show("Guías", "Las guías se cargan con el coach en marcha y STRATZ configurado.", "info", "●")
+            return
+        from .guidebrowser import GuideBrowser
+        self.guide_window = GuideBrowser(self, images=self.images, **opts)
+
+    def _deviation(self, what: str):
+        cb = self.actions.get("deviation")
+        if cb:
+            cb(what)
+
+    def _render_guide_line(self):
+        v = self.view
+        g = v.guide if v else None
+        show(self.n_guide, g is not None, row=6, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        if g:
+            kind = "Guía adaptada" if g.source == "adaptada" else "Tu guía"
+            setw(self.n_guide, text=f"\u2691 {kind}{' · ' + g.role if g.role else ''}: {g.done}/{g.total} objetos  "
+                                    f"(cambiar en «Guías…»)")
+            gd_items = [("\u2713 " if done else "\u2022 ") + n for n, done in g.items]
+            self.n_guide_tip.text = "\n".join(gd_items) + (f"\n{g.note}" if g.note else "")
+        d = v.deviation if v else None
+        show(self.dev_box, d is not None, row=7, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        if d:
+            setw(self.dev_text, text=f"Te has salido de la guía con {d.item_loc}. Los que ganaron siguiendo ese "
+                                     f"camino compraron después {d.suggestion_loc} ({d.reason})." +
+                                     (f" Tu guía dice {d.guide_next_loc}." if d.guide_next_loc else ""))
+        setw(self.cards["phases"]["extra"], text=f"guía {g.done}/{g.total}" if g else "")
 
     def _render_next(self):
         v = self.view
+        self._render_guide_line()
         card = v.next_item if v else None
         setw(self.cards["next"]["extra"], text=(phase_labels(v.turbo).get(v.phase, "") + (" · turbo" if v.turbo else ""))
              if v and v.hero else "")
@@ -1124,8 +1199,11 @@ class Panel(ctk.CTk):
                     show(slot["frame"], False)
                     continue
                 show(slot["frame"], True, row=0, column=slot["col"], padx=(0, 4))
-                img = self.images.item(card.short, (42, 31))
+                img = self.images.item(card.short, (42, 31), done=card.owned)
                 setw(slot["icon"], image=img, text="" if img else "?")
+                if card.owned:
+                    slot["tip"].text = f"\u2713 {card.loc}: ya lo tienes"
+                    continue
                 slot["tip"].text = f"{card.loc} · {card.cost} de oro\n" + "\n".join(card.reasons[:3]) + \
                     (f"\nParche: {card.patch_note}" if card.patch_note else "") + self._plan_text(card)
 
@@ -1253,6 +1331,15 @@ class Panel(ctk.CTk):
         img = ctk.CTkImage(light_image=frame, dark_image=frame, size=(self.MAP_SIZE, self.MAP_SIZE))
         self.map_label.configure(image=img)
         self._map_image = img  # que no se libere mientras se muestra
+
+    def _map_loop(self):
+        """El mapa va aparte del resto del panel (que se repinta cada 300 ms): cada fotograma nuevo se pinta en
+        cuanto llega (hasta ~20 por segundo), para que se mueva fluido."""
+        try:
+            self._render_map()
+        except Exception:
+            log.exception("error pintando el mapa")
+        self.after(50, self._map_loop)
 
     # ---------- consejos ----------
     def _build_tips(self, body):

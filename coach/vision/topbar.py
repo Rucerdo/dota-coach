@@ -117,10 +117,9 @@ def capture_tiles(cfg: dict | None = None) -> dict[int, Image.Image]:
     top = min(b[1] for b in boxes.values())
     right = max(b[2] for b in boxes.values())
     bottom = max(b[3] for b in boxes.values())
-    try:
-        strip = ImageGrab.grab((left, top, right, bottom), all_screens=True)
-    except OSError:
-        log.exception("no se pudo capturar la pantalla")
+    from .wincap import grab_dota
+    strip = grab_dota((left, top, right, bottom), client)   # de la ventana de Dota (aunque algo la tape)
+    if strip is None:
         return {}
     return {pid: strip.crop((b[0] - left, b[1] - top, b[2] - left, b[3] - top)) for pid, b in boxes.items()}
 

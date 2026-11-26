@@ -223,6 +223,104 @@ def run_live(cfg: dict, gd: GameData, meta, manual_enemies: list[Hero] = (),
                 log.exception("no se pudo preparar el orden de habilidades de %s", hero.loc)
         threading.Thread(target=job, daemon=True).start()
 
+    builds_asked: set[tuple] = set()   # (héroe, enemigo) ya pedidos a STRATZ
+
+    def ensure_builds(st: GameState, hero: Hero | None):
+        """Builds reales de STRATZ de tu héroe: generales y, por cada enemigo que aparece, unas cuantas contra él."""
+        if hero is None or not stats_src.use_stratz:
+            return
+        wanted = [(hero.id, None, 30)] + [(hero.id, e.id, 8) for e in advisor.enemies.values()]
+        todo = [w for w in wanted if w[:2] not in builds_asked]
+        if not todo:
+            return
+        builds_asked.update(w[:2] for w in todo)
+
+        def job():
+            from .data import stratz
+            for hero_id, against, take in todo:
+                try:
+                    rows = stratz.hero_builds(hero_id, against=against, take=take)
+                except Exception as ex:
+                    log.warning("builds de STRATZ (%s contra %s): %s", hero_id, against, ex)
+                    continue
+                if advisor.my_hero_id == hero_id:
+                    advisor.paths.add(rows)
+            push_view(st, force=True)
+        threading.Thread(target=job, daemon=True).start()
+
+    # ---------- guías (buscador en el panel) ----------
+    def fetch_guides(hero_id: int) -> list:
+        """Guías de un héroe: generales y, si es tu héroe, contra tus enemigos y con tus aliados."""
+        from .data import stratz
+        from .engine.guides import guides_from_rows
+        if not stratz.token(cfg):
+            raise RuntimeError("falta la clave de STRATZ (ajustes)")
+        rows = list(stratz.hero_builds(hero_id, take=30))
+        if hero_id == advisor.my_hero_id:
+            for e in list(advisor.enemies.values()):
+                rows += stratz.hero_builds(hero_id, against=e.id, take=8)
+            for a in list(advisor.allies.values()):
+                rows += stratz.hero_builds(hero_id, with_hero=a.id, take=5)
+            advisor.paths.add(rows)
+        return guides_from_rows(gd, hero_id, rows)
+
+    def save_guide(guide):
+        try:
+            fresh = config.load()
+            saved = fresh.setdefault("guides", {})
+            if guide is None:
+                saved.pop(str(advisor.my_hero_id or 0), None)
+            else:
+                saved[str(guide.hero_id)] = guide.to_dict()
+            config.save(fresh)
+            cfg["guides"] = saved
+        except OSError:
+            log.exception("no se pudo guardar la guía")
+
+    def choose_guide(guide):
+        advisor.follower.choose(guide)
+        save_guide(guide)
+        st = current["st"]
+        if st is not None:
+            push_view(st, force=True)
+
+    def guide_context():
+        position = ""
+        g = advisor.follower.guide
+        if g and g.hero_id == advisor.my_hero_id:
+            position = g.position
+        return advisor.my_hero_id or None, set(advisor.enemies), set(advisor.allies), position
+
+    def on_deviation(what: str):
+        st = current["st"]
+        dev = advisor.guide_deviation(st) if st is not None else None
+        if dev is None:
+            return
+        if what == "accept":
+            advisor.follower.accept(dev)
+            save_guide(advisor.follower.guide)
+        else:
+            advisor.follower.dismiss(dev)
+        push_view(st, force=True)
+
+    def restore_guide(hero: Hero | None):
+        """La guía que elegiste para este héroe en otra partida."""
+        from .engine.guides import Guide
+        g = advisor.follower.guide
+        if hero is None or (g and g.hero_id == hero.id):
+            return
+        saved = (cfg.get("guides") or {}).get(str(hero.id))
+        if saved:
+            try:
+                advisor.follower.choose(Guide.from_dict(saved))
+            except (TypeError, ValueError):
+                log.warning("guía guardada no válida para %s", hero.loc)
+
+    if panel:
+        panel.actions.update(guides=dict(gd=gd, fetch=fetch_guides, choose=choose_guide,
+                                         current=lambda: advisor.follower.guide, context=guide_context),
+                             deviation=on_deviation)
+
     def lane_tips_with_ai(rep):
         """Consejos de la IA para tu línea, una vez por combinación de héroes (en segundo plano)."""
         if provider is None or rep.key in lane_ai or not rep.opponents:
@@ -406,6 +504,7 @@ def run_live(cfg: dict, gd: GameData, meta, manual_enemies: list[Hero] = (),
                 if part:
                     part.reset()
             similar_key["k"] = draft_key["k"] = None
+            builds_asked.clear()
             if panel:
                 panel.post("reset")
         active = st.in_game or is_drafting(st)
@@ -417,6 +516,8 @@ def run_live(cfg: dict, gd: GameData, meta, manual_enemies: list[Hero] = (),
         hero = advisor.my_hero(st)
         ensure_bench(hero)
         ensure_hero_info(hero)
+        ensure_builds(st, hero)
+        restore_guide(hero)
         plan = hero_info.get(hero.id, (None, None))[0] if hero else None
         timers.role = item_role(hero, cfg.get("role", "auto"))
         map_alerts = mapwatch.update(st) if mapwatch else []
@@ -468,7 +569,8 @@ def run_live(cfg: dict, gd: GameData, meta, manual_enemies: list[Hero] = (),
     feed = None
     if panel and cfg.get("minimap_feed", True):
         from .vision.minimap import MinimapFeed
-        feed = MinimapFeed(lambda frame: panel.post("minimap", frame), cfg.get("minimap"))
+        feed = MinimapFeed(lambda frame: panel.post("minimap", frame), cfg.get("minimap"),
+                           interval=1 / max(1, min(30, int(cfg.get("minimap_fps", 10)))))
         feed.start()
     gsi.start()
     if panel:
